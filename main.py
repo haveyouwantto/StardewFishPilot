@@ -64,9 +64,10 @@ PAUSE_POLL_S = 0.05       # 暂停时轮询间隔（不截图，CPU 占用几乎
 
 CONF = 0.25               # YOLO 置信度
 IMGSZ = 640               # YOLO 输入尺寸
+IMGSZ_ROI = 416           # UI 锁定后的 YOLO 输入尺寸（更小=更快）
 
 ROI_PAD = 60              # UI 框外扩，避免鱼/条贴边被裁
-UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
+UI_RECHECK_EVERY = 40     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MIN_SCORE = 0.55       # UI 模板匹配阈值（调高更不容易误锁）
 UI_FISH_TIMEOUT_S = 1.5   # UI 锁定后，鱼持续这么久检测不到就解锁
 
@@ -361,7 +362,7 @@ def yolo_detect(frame, imgsz):
         conf=CONF,
         imgsz=imgsz,
         device=device,
-        max_det=4,
+        max_det=2,
     )
     if is_torch_model and device != "cpu":
         if USE_QUANTIZE_ARG:
@@ -396,11 +397,11 @@ def yolo_detect(frame, imgsz):
     return fish_pt, bar_box
 
 
-def detect_objects(frame):
+def detect_objects(frame, imgsz=IMGSZ):
     """按当前 detect_mode 在 frame(局部坐标) 上检测，返回 (fish_pt, bar_box)。"""
     if detect_mode == "cv":
         return cv_detect.detect(frame, cv_fish_tpl)
-    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
+    yolo_fish, yolo_bar = yolo_detect(frame, imgsz)
     if detect_mode == "mixed":
         cv_bar = cv_detect.detect_bar(frame)
         return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
@@ -644,7 +645,7 @@ def main():
                         # 候选框内没鱼：不锁定，也不浪费全图检测
                 else:
                     # 锁定后：整帧已经是 UI 区域，直接检测
-                    fish_pt, bar_box = detect_objects(frame)
+                    fish_pt, bar_box = detect_objects(frame, IMGSZ_ROI)
                     if do_ui_check and tpl_ui is not None:
                         hit = locate_ui(frame)
                         if hit is not None:
@@ -736,7 +737,7 @@ def main():
 
                 # ---------- Overlay（限频重绘） ----------
                 now = time.perf_counter()
-                if now - last_paint >= 0.05:
+                if now - last_paint >= 0.10:
                     fps = 1.0 / max(1e-6, now - t0)
                     info = {
                         "status": "RUNNING",
