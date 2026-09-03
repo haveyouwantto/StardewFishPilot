@@ -9,6 +9,7 @@
 
 import argparse
 import itertools
+import random
 import time
 from pathlib import Path
 
@@ -37,7 +38,8 @@ class EvalCallback(BaseCallback):
         if self.num_timesteps - self.last_eval < self.eval_freq:
             return True
         self.last_eval = self.num_timesteps
-        env = FishingEnv(seed=12345)
+        env = FishingEnv(seed=12345, control_hz=20,
+                         obs_noise=2.5, latency_ticks=2)
         wins = fails = 0
         accs = []
         lens = []
@@ -80,7 +82,11 @@ def main():
     ap.add_argument("--behavior", type=str, default=None)
     ap.add_argument("--difficulty-min", type=int, default=25)
     ap.add_argument("--difficulty-max", type=int, default=90)
-    ap.add_argument("--obs-noise", type=float, default=0.0)
+    ap.add_argument("--control-hz", type=int, default=20)
+    ap.add_argument("--noise-min", type=float, default=1.0)
+    ap.add_argument("--noise-max", type=float, default=4.0)
+    ap.add_argument("--latency-min", type=int, default=1)
+    ap.add_argument("--latency-max", type=int, default=3)
     ap.add_argument("--level", type=int, default=0)
     ap.add_argument("--save-freq", type=int, default=10_000)
     ap.add_argument("--eval-episodes", type=int, default=50)
@@ -90,16 +96,20 @@ def main():
         ap.error(f"--behavior 可选 {BEHAVIORS}")
     MODEL_DIR.mkdir(exist_ok=True)
 
-    seed_iter = itertools.count(1000)
+    rand_iter = itertools.count(1000)
 
     def make_env():
+        s = next(rand_iter)
+        rng = random.Random(s)
         return FishingEnv(
             difficulty=args.difficulty,
             behavior=args.behavior,
             level=args.level,
-            obs_noise=args.obs_noise,
+            obs_noise=rng.uniform(args.noise_min, args.noise_max),
+            control_hz=args.control_hz,
+            latency_ticks=rng.randint(args.latency_min, args.latency_max),
             difficulty_range=(args.difficulty_min, args.difficulty_max),
-            seed=next(seed_iter),
+            seed=s,
         )
 
     env = DummyVecEnv([make_env for _ in range(args.n_envs)])

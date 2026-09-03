@@ -41,6 +41,8 @@ class FishConfig:
     level: int = 0                            # 钓鱼等级，决定 bar 长度
     max_steps: int = 1500
     obs_noise: float = 0.0                    # 观测噪声 px（模拟 YOLO）
+    control_hz: int = 60                      # 决策频率（物理仍 60Hz）
+    latency_ticks: int = 0                    # 输入延迟（60Hz tick 数）
 
 
 class FishingEnv(gym.Env):
@@ -53,6 +55,8 @@ class FishingEnv(gym.Env):
         level: int = 0,
         max_steps: int = 1500,
         obs_noise: float = 0.0,
+        control_hz: int = 60,
+        latency_ticks: int = 0,
         difficulty_range: tuple[int, int] = (25, 90),
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
@@ -60,13 +64,18 @@ class FishingEnv(gym.Env):
         super().__init__()
         if behavior is not None and behavior not in BEHAVIORS:
             raise ValueError(f"behavior 必须是 {BEHAVIORS}")
+        if 60 % control_hz != 0 or not (10 <= control_hz <= 60):
+            raise ValueError("control_hz 必须是 10~60 且能整除 60")
         self.cfg = FishConfig(
             difficulty=difficulty,
             behavior=behavior,
             level=level,
             max_steps=max_steps,
             obs_noise=obs_noise,
+            control_hz=control_hz,
+            latency_ticks=latency_ticks,
         )
+        self._substeps = 60 // control_hz
         self.difficulty_range = difficulty_range
         self.render_mode = render_mode
         self._rng = random.Random(seed)
@@ -92,6 +101,16 @@ class FishingEnv(gym.Env):
         self.last_action = 0
         self.prev_noisy_bar = None
         self.prev_noisy_fish = None
+        self.prev_true_bar = None
+        self.prev_true_fish = None
+        self._schedule = {}
+        self._last_cmd = 0
+        self._prev_action = 0
+        self.prev_true_bar = None
+        self.prev_true_fish = None
+        self._schedule: dict[int, int] = {}
+        self._last_cmd = 0
+        self._prev_action = 0
 
     # ---------------- 工具 ----------------
     def _rand(self, lo: float, hi: float) -> float:
@@ -175,7 +194,7 @@ class FishingEnv(gym.Env):
         self._new_fish()
         return self._observe(self.bar_pos, self.fish_pos, 0.0, 0.0), {}
 
-    def step(self, action: int):
+    def _tick_60(self, action: int):
         action = int(action)
         hold = action == 1
         r = self._rng
@@ -244,9 +263,6 @@ class FishingEnv(gym.Env):
 
         # ---------- 奖励 ----------
         reward = (2.0 if in_bar else -3.0) / 60.0
-        if action != self.last_action:
-            reward -= 0.002
-        self.last_action = action
         self.steps += 1
 
         terminated = self.progress >= 1000 or self.progress <= 0
@@ -254,36 +270,65 @@ class FishingEnv(gym.Env):
             reward += 5.0
         elif self.progress <= 0:
             reward -= 5.0
-        truncated = self.steps >= self.cfg.max_steps
+        return reward, terminated, self.progress >= 1000, in_bar
 
-        # ---------- 观测（可选加噪声，模拟 YOLO） ----------
+    def step(self, action: int):
+        """一个决策步 = 推进 60/control_hz 个内部 tick（如 20Hz=3 tick），
+        动作经 latency_ticks 延迟生效；观测带测量噪声。"""
+        action = int(action)
+        # 输入延迟：本次动作在 latency_ticks 个内部 tick 后才生效
+        self._schedule[self.steps + self.cfg.latency_ticks] = action
+
+        total_reward = 0.0
+        terminated = truncated = False
+        success = False
+        for _ in range(self._substeps):
+            if self.steps >= self.cfg.max_steps:
+                truncated = True
+                break
+            cmd = self._schedule.get(self.steps, self._last_cmd)
+            self._last_cmd = cmd
+            r, term, success, _in_bar = self._tick_60(cmd)
+            total_reward += r
+            if term:
+                terminated = True
+                break
+        if action != self._prev_action:
+            total_reward -= 0.002
+        self._prev_action = action
+        self.last_action = action
+
+        # ---------- 观测：每 control 步采样一次 + 测量噪声 ----------
         n = self.cfg.obs_noise
         if n > 0:
-            bar_obs = self.bar_pos + r.gauss(0, n)
-            fish_obs = self.fish_pos + r.gauss(0, n)
+            bar_obs = self.bar_pos + self._rng.gauss(0.0, n)
+            fish_obs = self.fish_pos + self._rng.gauss(0.0, n)
             if self.prev_noisy_bar is None:
-                bar_vel_obs = 0.0
-                fish_vel_obs = 0.0
+                bar_vel_obs = fish_vel_obs = 0.0
             else:
-                bar_vel_obs = bar_obs - self.prev_noisy_bar
-                fish_vel_obs = fish_obs - self.prev_noisy_fish
+                bar_vel_obs = (bar_obs - self.prev_noisy_bar) / self._substeps
+                fish_vel_obs = (fish_obs - self.prev_noisy_fish) / self._substeps
             self.prev_noisy_bar = bar_obs
             self.prev_noisy_fish = fish_obs
         else:
-            bar_obs = self.bar_pos
-            fish_obs = self.fish_pos
-            bar_vel_obs = self.bar_vel
-            fish_vel_obs = self.fish_vel + self.fish_base_vel
+            bar_obs, fish_obs = self.bar_pos, self.fish_pos
+            if self.prev_true_bar is None:
+                bar_vel_obs = fish_vel_obs = 0.0
+            else:
+                bar_vel_obs = (bar_obs - self.prev_true_bar) / self._substeps
+                fish_vel_obs = (fish_obs - self.prev_true_fish) / self._substeps
+            self.prev_true_bar = bar_obs
+            self.prev_true_fish = fish_obs
 
         obs = self._observe(bar_obs, fish_obs, bar_vel_obs, fish_vel_obs)
         info = {
             "progress": self.progress,
-            "in_bar": in_bar,
+            "in_bar": self._was_in_bar(),
             "difficulty": self.difficulty,
             "behavior": self.behavior,
-            "success": self.progress >= 1000,
+            "success": success,
         }
-        return obs, reward, terminated, truncated, info
+        return obs, total_reward, terminated, truncated, info
 
     # ---------------- 渲染 ----------------
     def _frame_rgb(self, scale: int = 3):
