@@ -169,7 +169,9 @@ def main():
     ap.add_argument("--difficulty", type=int, default=None)
     ap.add_argument("--behavior", type=str, default=None)
     ap.add_argument("--level", type=int, default=0)
-    ap.add_argument("--obs-noise", type=float, default=0.0)
+    ap.add_argument("--obs-noise", type=float, default=2.5)
+    ap.add_argument("--control-hz", type=int, default=20)
+    ap.add_argument("--latency-ticks", type=int, default=2)
     ap.add_argument("--no-window", action="store_true", help="不弹窗，纯统计")
     ap.add_argument("--height", type=int, default=780, help="仪表盘高度 px")
     args = ap.parse_args()
@@ -182,6 +184,8 @@ def main():
         behavior=args.behavior,
         level=args.level,
         obs_noise=args.obs_noise,
+        control_hz=args.control_hz,
+        latency_ticks=args.latency_ticks,
         render_mode="rgb_array",
     )
 
