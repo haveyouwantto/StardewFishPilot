@@ -57,7 +57,7 @@ USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quanti
 # ====================== 配置 ======================
 DETECT_MODE = "mixed"     # "mixed"=鱼YOLO+条传统(推荐)  "cv"/"yolo" 备用
 DETECT_CHOICES = ("cv", "mixed", "yolo")
-USE_RL = True             # True: 用 rl_fishing 训练的策略；False: 用 PDM-PID
+CONTROL_MODE = "rl"       # 全局默认控制模式: "rl" 或 "pid"（F7 随时切换）
 RL_PROGRESS = 0.30        # 暂未读游戏进度条，用训练起始附近固定估计
 RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 一致
 RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 一致
@@ -100,6 +100,7 @@ VEL_ALPHA = 0.80         # 速度低通滤波系数
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
+TOGGLE_CTRL_HOTKEY = Key.f7    # 随时切换 RL / PID
 TOGGLE_DETECT_HOTKEY = Key.f6   # 运行时切换 cv / YOLO 检测
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -121,10 +122,11 @@ cv_fish_tpl = None
 detect_mode = DETECT_MODE
 yolo_engine_name = "CUDA"
 rl_policy = None
+control_mode = CONTROL_MODE   # 全局：当前选择的模式（F7 修改）
 
 
 def on_press(key):
-    global running, exit_flag, detect_mode, engine_name
+    global running, exit_flag, detect_mode, engine_name, control_mode
     try:
         if key == START_HOTKEY:
             running = not running
@@ -133,6 +135,15 @@ def on_press(key):
             exit_flag = True
             print("退出中...")
             return False
+        elif key == TOGGLE_CTRL_HOTKEY:
+            if control_mode == "rl":
+                control_mode = "pid"
+            elif rl_policy is not None:
+                control_mode = "rl"
+            else:
+                control_mode = "pid"
+                print("无 RL 模型，保持 PID")
+            print(f"模式选择: {control_mode.upper()}（暂停或当前局结束后生效）")
         elif key == TOGGLE_DETECT_HOTKEY:
             i = DETECT_CHOICES.index(detect_mode)
             detect_mode = DETECT_CHOICES[(i + 1) % len(DETECT_CHOICES)]
@@ -324,13 +335,28 @@ def update_overlay(info):
             win32gui.ExtTextOut(hdc, int(x), int(y), 0, None, s)
 
         st = info.get("status", "PAUSED")
-        col = win32api.RGB(0, 255, 0) if st == "RUNNING" else win32api.RGB(255, 80, 80)
+        stcol = (win32api.RGB(0, 255, 0) if st == "RUNNING"
+                 else win32api.RGB(255, 80, 80))
+        mode = info.get("mode", "rl")
+        pending = info.get("pending")
         fps = info.get("fps", 0)
-        tag = f"  {fps:.0f} FPS" if fps > 0 else ""
-        text(16, 16, f"[F8] {st}  [F9] Quit  {engine_name}{tag}", col)
+        fps_s = f"  {fps:.0f} FPS" if fps > 0 else ""
+        text(16, 16, f"[F8] {st}", stcol)
+        if pending:
+            text(130, 16, f"[F7] {mode.upper()} -> {pending.upper()}",
+                 win32api.RGB(255, 200, 0))
+        else:
+            text(130, 16, f"[F7] {mode.upper()}", win32api.RGB(255, 255, 255))
+        text(300, 16, f"[F6] {engine_name}{fps_s}",
+             win32api.RGB(180, 190, 200))
+        text(560, 16, "[F9] Quit", win32api.RGB(140, 150, 160))
+        if pending:
+            text(16, 40, "切换将在暂停或当前局结束后生效",
+                 win32api.RGB(255, 200, 0))
 
         if info.get("dbg"):
-            text(16, 40, info["dbg"], win32api.RGB(255, 255, 255))
+            dbg_y = 60 if pending else 40
+            text(16, dbg_y, info["dbg"], win32api.RGB(255, 255, 255))
 
         if info.get("ui"):
             x, y, w, h = info["ui"]
@@ -428,8 +454,6 @@ class RLPolicy:
 
 def load_rl_policy():
     global rl_policy
-    if not USE_RL:
-        return None
     best = SCRIPT_DIR / "rl_fishing" / "models" / "best_model.zip"
     path = best if best.exists() else (
         SCRIPT_DIR / "rl_fishing" / "models" / "final_model.zip")
@@ -606,8 +630,10 @@ def main():
     was_running = False
     pid = FishPID()
     rl = load_rl_policy()
-    print(f"控制: {'RL' if rl is not None else 'PDM-PID'}   检测: "
-          f"{detect_mode.upper()}（F6 可切换）")
+    active_mode = CONTROL_MODE
+    print(f"默认控制: {active_mode.upper()}"
+          f"{'（RL 已加载）' if rl is not None else '（无 RL，用 PID）'}   "
+          f"检测: {detect_mode.upper()}（F6 切换，F7 切模式）")
     dbg_log = []
     dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
@@ -646,11 +672,19 @@ def main():
                     if was_running:
                         pid.reset()          # 回来时速度历史已失效
                         was_running = False
+                    if control_mode != active_mode:
+                        active_mode = control_mode
+                        print(f"控制模式已生效: {active_mode.upper()}")
                     if is_holding:
                         keyboard.release(HOLD_KEY)
                         is_holding = False
                     if time.perf_counter() - last_paint >= 0.2:
-                        update_overlay({"status": "PAUSED"})
+                        update_overlay({
+                            "status": "PAUSED",
+                            "mode": active_mode,
+                            "pending": (control_mode if control_mode !=
+                                        active_mode else None),
+                        })
                         last_paint = time.perf_counter()
                         win32gui.PumpWaitingMessages()
                     time.sleep(PAUSE_POLL_S)
@@ -751,11 +785,15 @@ def main():
                     print("UI 释放（长时间未检测到鱼）")
 
                 # ---------- 按键控制（RL / PDM-PID） ----------
+                if control_mode != active_mode and ui_rect is None:
+                    active_mode = control_mode
+                    print(f"控制模式已生效: {active_mode.upper()}")
                 ctrl_t = time.perf_counter()
                 ctrl_tag = "PID"
                 if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    if rl is not None and ui_rect is not None:
+                    if (active_mode == "rl" and rl is not None and
+                            ui_rect is not None):
                         ctrl_tag = "RL"
                         pid.observe(ctrl_t, bar_cy, last_fish[1],
                                     bar_seen=bar_seen_now,
@@ -809,6 +847,9 @@ def main():
                     info = {
                         "status": "RUNNING",
                         "fps": fps,
+                        "mode": active_mode,
+                        "pending": (control_mode if control_mode !=
+                                    active_mode else None),
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
