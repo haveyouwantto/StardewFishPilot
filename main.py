@@ -69,6 +69,8 @@ UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定�
 
 FISH_MEMORY_FRAMES = 4    # 鱼短暂漏检时沿用上一帧位置，避免误松键
 BAR_MEMORY_FRAMES = 4     # bar 短暂漏检时的容错
+MAX_FISH_STEP_PX = 160.0  # 鱼相邻帧最大位移，超过视为误检(跳变)忽略
+MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳变)忽略
 
 # ====================== PID 控制参数 ======================
 # 坐标约定: y 向下为正；bar 中心 > 鱼 y 表示 bar 在鱼下方。
@@ -80,9 +82,9 @@ KD = 0.35                # 阻尼项（鱼与 bar 的相对速度），抑制过
 VEL_BAND = 12.0          # 速度死区 px/s，避免按键抖动
 INTEGRAL_LIMIT = 300.0   # 积分限幅
 FISH_LOOKAHEAD_S = 0.12  # 用鱼的速度外推一小段，提前反应
-VEL_WINDOW_S = 0.10      # bar 速度估计的滑动窗口（秒）
-FISH_WINDOW_S = 0.16     # 鱼速度估计的滑动窗口（秒）
-VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手）
+VEL_WINDOW_S = 0.25      # bar 速度估计的滑动窗口（秒，按实际低帧率放宽）
+FISH_WINDOW_S = 0.25     # 鱼速度估计的滑动窗口（秒）
+VEL_ALPHA = 0.60         # 速度低通滤波系数（越大越跟手）
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
 A_PRESS_SEED = 1600.0    # 按住时加速度估计初值 px/s^2（运行中自适应）
 A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
@@ -126,7 +128,7 @@ is_torch_model = True
 engine_name = "CPU"
 tpl_ui = None
 has_rl = False            # 是否成功加载 RL 模型
-ctrl_mode = 0             # F7 循环: 0=RL 1=PID 2=SIMPLE(旧上下判断)
+ctrl_mode = 2             # F7 循环: 0=RL 1=PID 2=SIMPLE；默认 SIMPLE 便于回退
 
 
 def on_press(key):
@@ -649,7 +651,7 @@ def main():
             if first:
                 f.write(
                     "t,algo,fish_y,bar_y,vf_px_s,vb_px_s,pos_f,pos_b,"
-                    "vel_f,vel_b,action,holding,ui_h\n"
+                    "vel_f,vel_b,action,holding,ui_h,fish_seen,bar_seen\n"
                 )
             for row in dbg_log:
                 f.write(",".join(row) + "\n")
@@ -735,20 +737,34 @@ def main():
                 # ---------- YOLO：锁定后 frame 已是 UI 区域 ----------
                 fish_pt, bar_box = yolo_detect(frame, IMGSZ)
 
-                # ---------- 短时记忆：漏检 1~2 帧不丢位置 ----------
+                # ---------- 检测稳定性：短时记忆 + 跳变过滤 ----------
+                fish_seen_now = False
                 if fish_pt is not None:
-                    last_fish = (ox + fish_pt[0], oy + fish_pt[1])
-                    fish_mem = 0
-                else:
+                    cand_fish = (ox + fish_pt[0], oy + fish_pt[1])
+                    ok = (last_fish is None or
+                          abs(cand_fish[1] - last_fish[1]) <= MAX_FISH_STEP_PX)
+                    if ok:
+                        last_fish = cand_fish
+                        fish_seen_now = True
+                        fish_mem = 0
+                if not fish_seen_now:
                     fish_mem += 1
                     if fish_mem > FISH_MEMORY_FRAMES:
                         last_fish = None
 
+                bar_seen_now = False
                 if bar_box is not None:
                     bx1, by1, bx2, by2 = bar_box
-                    last_bar = (ox + bx1, oy + by1, ox + bx2, oy + by2)
-                    bar_mem = 0
-                else:
+                    cand_bar = (ox + bx1, oy + by1, ox + bx2, oy + by2)
+                    old_cy = ((last_bar[1] + last_bar[3]) / 2
+                              if last_bar is not None else None)
+                    new_cy = (cand_bar[1] + cand_bar[3]) / 2
+                    ok = (old_cy is None or abs(new_cy - old_cy) <= MAX_BAR_STEP_PX)
+                    if ok:
+                        last_bar = cand_bar
+                        bar_seen_now = True
+                        bar_mem = 0
+                if not bar_seen_now:
                     bar_mem += 1
                     if bar_mem > BAR_MEMORY_FRAMES:
                         last_bar = None
@@ -767,8 +783,8 @@ def main():
                             ctrl_t,
                             bar_cy,
                             last_fish[1],
-                            bar_seen=bar_box is not None,
-                            fish_seen=fish_pt is not None,
+                            bar_seen=bar_seen_now,
+                            fish_seen=fish_seen_now,
                         )
                         obs = rl_make_obs(
                             last_fish[1], bar_cy, ui_rect, pid, int(is_holding)
@@ -782,8 +798,8 @@ def main():
                             ctrl_t,
                             bar_cy,
                             last_fish[1],
-                            bar_seen=bar_box is not None,
-                            fish_seen=fish_pt is not None,
+                            bar_seen=bar_seen_now,
+                            fish_seen=fish_seen_now,
                         )
                     # 通用调试日志（任意模式都会记录）
                     if ui_rect is not None:
@@ -811,6 +827,8 @@ def main():
                             "1" if act else "0",
                             "1" if is_holding else "0",
                             f"{ui_rect[3]:.0f}" if ui_rect else "0",
+                            "1" if fish_seen_now else "0",
+                            "1" if bar_seen_now else "0",
                         ]
                     )
                     if len(dbg_log) >= 500:
