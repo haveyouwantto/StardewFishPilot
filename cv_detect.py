@@ -87,13 +87,6 @@ def detect_bar(frame_bgr, fish=None, band=None):
     sh = y1 - y0
     hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, GREEN_HSV_LOW, GREEN_HSV_HIGH)
-    # 纹理平滑：中值去噪 + 纵向大闭运算把鱼遮挡造成的断口补成连续绿色
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 31)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
 
     # 平滑度检测：bar 是均匀纯色，边缘/纹理量很低
     gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
