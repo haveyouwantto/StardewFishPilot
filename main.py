@@ -61,6 +61,11 @@ CONTROL_MODE = "rl"       # 全局默认控制模式: "rl" 或 "pid"（F7 随时
 RL_PROGRESS = 0.30        # 暂未读游戏进度条，用训练起始附近固定估计
 RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 一致
 RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 一致
+GITHUB_REPO = "haveyouwantto/StardewFishPilot"
+MODEL_RELEASE_TAG = "v0.1-models"          # 固定到带模型附件的 release 标签
+YOLO_MODEL_ASSET = "stardew_fish_best.pt"   # Release 附件名
+RL_MODEL_ASSET = "rl_fishing_best.zip"      # Release 附件名
+DOWNLOAD_TIMEOUT_S = 60
 
 HOLD_KEY = "c"
 FPS_TARGET = 40           # 运行帧率上限
@@ -154,6 +159,38 @@ def on_press(key):
         pass
 
 
+def download_file(path, asset):
+    """从固定 GitHub Release 标签下载模型；成功返回 True。"""
+    import urllib.request
+
+    url = (f"https://github.com/{GITHUB_REPO}/releases/download/"
+           f"{MODEL_RELEASE_TAG}/{asset}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".part")
+    print(f"缺少模型文件，尝试从 GitHub Release 下载: {asset}")
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "StardewFishPilot/1.0"})
+        with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT_S) as resp, \
+                open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+        tmp.replace(path)
+        print(f"下载完成: {path}")
+        return True
+    except Exception as exc:
+        print(f"模型下载失败（{exc}），继续使用本地回退")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def find_weights():
     for folder in (
         SCRIPT_DIR / "yolo_runs" / "stardew_fish" / "weights",
@@ -181,6 +218,11 @@ def load_models():
         print("警告: templates/fish.png 不存在，CV 模式鱼将无法检测")
 
     w = find_weights()
+    if w is None:
+        target = (SCRIPT_DIR / "yolo_runs" / "stardew_fish" /
+                  "weights" / "best.pt")
+        if download_file(target, YOLO_MODEL_ASSET):
+            w = target
     if w is None:
         w = SCRIPT_DIR / "yolov8n.pt"
         print("未找到训练权重，使用 yolov8n.pt 演示（请先训练）")
@@ -483,6 +525,8 @@ def load_rl_policy():
     best = SCRIPT_DIR / "rl_fishing" / "models" / "best_model.zip"
     path = best if best.exists() else (
         SCRIPT_DIR / "rl_fishing" / "models" / "final_model.zip")
+    if not path.exists() and download_file(best, RL_MODEL_ASSET):
+        path = best
     if not path.exists():
         print("未找到 RL 模型，使用 PDM-PID")
         return None

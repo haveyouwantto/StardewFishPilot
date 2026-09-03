@@ -50,6 +50,10 @@ uv run python rl_fishing/train.py --timesteps 200000
 
 想了解当前 PDM-PID 在模拟环境中的水平，可以运行 rl_fishing/test_pid_gym.py 查看各难度下的胜率和准度。
 
+## 模型与 Release
+
+模型文件体积较大，默认不随仓库提交。首次运行如果本地缺少 YOLO 权重或 RL 策略，程序会从 GitHub Release 固定标签 v0.1-models 自动下载，不需要手动放置文件。下载地址写成固定标签而不是 latest，是为了避免以后某个不带模型的 release 覆盖掉可用版本。对应的附件名分别是 stardew_fish_best.pt 和 rl_fishing_best.zip；如果 release 里还没有这两个文件，程序会提示下载失败并继续使用本地回退，比如演示用的 yolov8n.pt 或 PDM-PID。发布模型时保持这两个附件名不变即可，仓库地址与标签在 main.py 顶部的 GITHUB_REPO、MODEL_RELEASE_TAG 配置里。
+
 ## 已知限制
 
 游戏进度条还没有读取，RL 观测里的 progress 是固定估计值，所以策略并不清楚是否接近胜利。训练只覆盖了钓鱼等级 0，等级变化会改变条的长度，策略不一定跟得上。真实机器在十七到二十帧左右时，控制效果会明显变差，而模拟器在 60Hz 与 20Hz 下的差距本身就很大。cv 模式的鱼模板只对同一种外观的鱼有效，换鱼种容易漏检。此外 ROI 和模板参数依赖固定分辨率与窗口布局，换环境基本要重新校准。
