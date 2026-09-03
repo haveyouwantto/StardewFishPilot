@@ -304,6 +304,11 @@ def update_overlay(info):
         return
     hdc = win32gui.GetDC(hwnd_overlay)
     try:
+        # 大号加粗字体（描边后更清晰）
+        font = win32gui.CreateFont(
+            -24, 0, 0, 0, 700, 0, 0, 0,
+            1, 0, 0, 4, 0, "Microsoft YaHei UI")
+        old_font = win32gui.SelectObject(hdc, font)
         br = win32gui.CreateSolidBrush(win32api.RGB(0, 0, 0))
         win32gui.FillRect(hdc, (0, 0, screen_w, screen_h), br)
         win32gui.DeleteObject(br)
@@ -328,9 +333,13 @@ def update_overlay(info):
 
         def text(x, y, s, color):
             win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                win32gui.SetTextColor(hdc, win32api.RGB(0, 0, 0))
-                win32gui.ExtTextOut(hdc, int(x + dx), int(y + dy), 0, None, s)
+            for dx in (-2, 0, 2):
+                for dy in (-2, 0, 2):
+                    if dx == 0 and dy == 0:
+                        continue
+                    win32gui.SetTextColor(hdc, win32api.RGB(0, 0, 0))
+                    win32gui.ExtTextOut(hdc, int(x + dx), int(y + dy),
+                                        0, None, s)
             win32gui.SetTextColor(hdc, color)
             win32gui.ExtTextOut(hdc, int(x), int(y), 0, None, s)
 
@@ -339,24 +348,25 @@ def update_overlay(info):
                  else win32api.RGB(255, 80, 80))
         mode = info.get("mode", "rl")
         pending = info.get("pending")
+        fishing = info.get("fishing", False)
         fps = info.get("fps", 0)
-        fps_s = f"  {fps:.0f} FPS" if fps > 0 else ""
-        text(16, 16, f"[F8] {st}", stcol)
+        fps_s = f"{fps:.0f} FPS" if fps > 0 else "--"
+        mode_s = (f"{mode.upper()}->{pending.upper()}" if pending
+                  else mode.upper())
+        det_s = engine_name.replace("CV+YOLO", "MIXED")
+        # 按 F6-F9 顺序单行显示
+        text(12, 10, f"F6 {det_s}  {fps_s}", win32api.RGB(180, 255, 255))
+        text(300, 10, f"F7 {mode_s}", win32api.RGB(255, 230, 120))
+        text(450, 10, f"F8 {st}", stcol)
+        text(640, 10, "F9 Quit", win32api.RGB(210, 215, 220))
+        dbg_y = 46
         if pending:
-            text(130, 16, f"[F7] {mode.upper()} -> {pending.upper()}",
+            text(12, 46, "切换将在暂停或当前局结束后生效",
                  win32api.RGB(255, 200, 0))
-        else:
-            text(130, 16, f"[F7] {mode.upper()}", win32api.RGB(255, 255, 255))
-        text(300, 16, f"[F6] {engine_name}{fps_s}",
-             win32api.RGB(180, 190, 200))
-        text(560, 16, "[F9] Quit", win32api.RGB(140, 150, 160))
-        if pending:
-            text(16, 40, "切换将在暂停或当前局结束后生效",
-                 win32api.RGB(255, 200, 0))
-
-        if info.get("dbg"):
-            dbg_y = 60 if pending else 40
-            text(16, dbg_y, info["dbg"], win32api.RGB(255, 255, 255))
+            dbg_y = 74
+        # 钓鱼过程信息：进入钓鱼(UI 锁定)才显示
+        if fishing and info.get("dbg"):
+            text(12, dbg_y, info["dbg"], win32api.RGB(255, 255, 255))
 
         if info.get("ui"):
             x, y, w, h = info["ui"]
@@ -372,6 +382,12 @@ def update_overlay(info):
             circle(fx, fy, 8, win32api.RGB(80, 160, 255), 3)
             text(fx + 10, fy - 8, "FISH", win32api.RGB(80, 160, 255))
     finally:
+        _f = locals().get("font")
+        _o = locals().get("old_font")
+        if _f is not None:
+            if _o is not None:
+                win32gui.SelectObject(hdc, _o)
+            win32gui.DeleteObject(_f)
         win32gui.ReleaseDC(hwnd_overlay, hdc)
 
 
@@ -850,6 +866,7 @@ def main():
                         "mode": active_mode,
                         "pending": (control_mode if control_mode !=
                                     active_mode else None),
+                        "fishing": ui_rect is not None,
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
