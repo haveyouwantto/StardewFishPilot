@@ -104,8 +104,9 @@ def detect_bar(frame_bgr, fish=None, band=None):
         if aspect < BAR_ASPECT_MIN or aspect > BAR_ASPECT_MAX:
             continue
         if fish is not None:
-            # 只要求绿条 y 范围与鱼 y 有交集
-            if not (y <= fish[1] <= y + h):
+            # 条必须穿过鱼的 y 中心点（用整帧坐标，搜索带裁切要加 y0 偏移）
+            gy0, gy1 = y0 + y, y0 + y + h
+            if not (gy0 <= fish[1] <= gy1):
                 continue
         if area > best_area:
             best_area = area
