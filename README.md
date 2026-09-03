@@ -50,9 +50,9 @@ uv run python rl_fishing/train.py --timesteps 200000
 
 想了解当前 PDM-PID 在模拟环境中的水平，可以运行 rl_fishing/test_pid_gym.py 查看各难度下的胜率和准度。
 
-## 模型与 Release
+## 模型下载
 
-模型文件体积较大，默认不随仓库提交。首次运行如果本地缺少 YOLO 权重或 RL 策略，程序会从 GitHub Release 固定标签 v0.1-models 自动下载，不需要手动放置文件。下载地址写成固定标签而不是 latest，是为了避免以后某个不带模型的 release 覆盖掉可用版本。对应的附件名分别是 stardew_fish_best.pt 和 rl_fishing_best.zip；如果 release 里还没有这两个文件，程序会提示下载失败并继续使用本地回退，比如演示用的 yolov8n.pt 或 PDM-PID。发布模型时保持这两个附件名不变即可，仓库地址与标签在 main.py 顶部的 GITHUB_REPO、MODEL_RELEASE_TAG 配置里。
+模型文件不随仓库提交。首次运行缺少 YOLO 权重或 RL 策略时，程序会自动从 GitHub Release 下载，无需手动放置；下载失败会提示并回退到演示权重或 PDM-PID。
 
 ## 已知限制
 
