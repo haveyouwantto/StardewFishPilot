@@ -63,7 +63,8 @@ USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quanti
 #   "rl"     = rl_fishing 训练的策略
 # 命令行 --mode 或启动时菜单可以覆盖这里；运行中 F7 仍可切换。
 CONTROL_MODE = "simple"
-DETECT_MODE = "cv"        # "cv" = 传统模板+绿色矩形, "yolo" = YOLO
+DETECT_MODE = "mixed"     # "cv"=全传统  "mixed"=鱼YOLO+条传统  "yolo"=全YOLO
+DETECT_CHOICES = ("cv", "mixed", "yolo")
 
 HOLD_KEY = "c"
 SIMPLE_BAND = 12          # SIMPLE 迟滞带 px：按住中鱼低于中心 12px 才松，
@@ -162,9 +163,10 @@ def on_press(key):
             names = {0: "RL", 1: "PID", 2: "SIMPLE"}
             print(f"控制模式: {names[ctrl_mode]}")
         elif key == TOGGLE_DETECT_HOTKEY:
-            detect_mode = "yolo" if detect_mode == "cv" else "cv"
-            engine_name = ("CV" if detect_mode == "cv"
-                           else yolo_engine_name)
+            i = DETECT_CHOICES.index(detect_mode)
+            detect_mode = DETECT_CHOICES[(i + 1) % len(DETECT_CHOICES)]
+            labels = {"cv": "CV", "mixed": "CV+YOLO", "yolo": yolo_engine_name}
+            engine_name = labels[detect_mode]
             print(f"检测模式: {detect_mode.upper()}")
     except Exception:
         pass
@@ -224,7 +226,8 @@ def load_models():
     else:
         yolo_engine_name = "ONNX"
         print(f"YOLO 推理: ONNX ({'CUDA' if device != 'cpu' else 'CPU'})")
-    engine_name = "CV" if detect_mode == "cv" else yolo_engine_name
+    labels = {"cv": "CV", "mixed": "CV+YOLO", "yolo": yolo_engine_name}
+    engine_name = labels[detect_mode]
 
     ui_full = TEMPLATE_DIR / "ui_full.png"
     if ui_full.exists():
@@ -778,7 +781,13 @@ def main():
                 if detect_mode == "cv":
                     fish_pt, bar_box = cv_detect.detect(frame, cv_fish_tpl)
                 else:
-                    fish_pt, bar_box = yolo_detect(frame, IMGSZ)
+                    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
+                    if detect_mode == "mixed":
+                        cv_bar = cv_detect.detect_bar(frame)
+                        fish_pt = yolo_fish
+                        bar_box = cv_bar if cv_bar is not None else yolo_bar
+                    else:
+                        fish_pt, bar_box = yolo_fish, yolo_bar
 
                 # ---------- 检测稳定性：短时记忆 + 跳变过滤 ----------
                 fish_seen_now = False
