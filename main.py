@@ -76,7 +76,7 @@ BAR_MEMORY_FRAMES = 4     # bar 短暂漏检时的容错
 # 用“实测 bar 速度 vs 目标速度”决定按/松的时机，避免只看位置冲过头。
 KP = 2.5                 # 位置增益：误差 1px ≈ 目标速度多 2.5px/s
 KI = 0.12                # 积分增益，消除持续偏差
-KD = 0.20                # 阻尼项（鱼与 bar 的相对速度），抑制过冲
+KD = 0.35                # 阻尼项（鱼与 bar 的相对速度），抑制过冲
 VEL_BAND = 12.0          # 速度死区 px/s，避免按键抖动
 INTEGRAL_LIMIT = 300.0   # 积分限幅
 FISH_LOOKAHEAD_S = 0.12  # 用鱼的速度外推一小段，提前反应
@@ -88,7 +88,9 @@ A_PRESS_SEED = 1600.0    # 按住时加速度估计初值 px/s^2（运行中自�
 A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
 ACCEL_ALPHA = 0.12       # 加速度估计的学习率
 CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
-PRED_MARGIN_PX = 6.0     # 刹车距离预测的提前余量 px
+PRED_MARGIN_PX = 10.0    # 刹车距离预测的提前余量 px
+ACTUATION_LAG_S = 0.08   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
+STOP_FACTOR = 1.5        # 刹车距离放大系数（>1 提前切键，防冲过头）
 SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
@@ -493,7 +495,11 @@ class FishPID:
             if self.v_bar < -SPEED_EPS:      # bar 正在上冲：松开让其减速
                 action = False
             elif self.v_bar > 0:             # 正在下坠：算按下后的刹车距离
-                stop = self.v_bar * self.v_bar / (2 * self.a_press)
+                # 若继续松手，延迟期间还会继续加速下坠
+                v_lag = self.v_bar
+                if not self.last_action:
+                    v_lag += self.a_release * ACTUATION_LAG_S
+                stop = STOP_FACTOR * v_lag * v_lag / (2 * self.a_press)
                 action = True if e <= stop + PRED_MARGIN_PX else False
             else:                            # 静止：松开开始下落
                 action = False
@@ -501,7 +507,11 @@ class FishPID:
             if self.v_bar > SPEED_EPS:       # bar 正在下落：按住刹车并上冲
                 action = True
             elif self.v_bar < 0:             # 正在上冲：算松开后的滑行距离
-                stop = self.v_bar * self.v_bar / (2 * self.a_release)
+                # 若继续按住，延迟期间还会继续加速上冲
+                v_lag = self.v_bar
+                if self.last_action:
+                    v_lag -= self.a_press * ACTUATION_LAG_S
+                stop = STOP_FACTOR * v_lag * v_lag / (2 * self.a_release)
                 action = False if -e <= stop + PRED_MARGIN_PX else True
             else:                            # 静止：按住开始上冲
                 action = True
@@ -675,7 +685,8 @@ def main():
                         "fps": fps,
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
-                                f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f}"),
+                                f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
+                                f"ap={pid.a_press:.0f} ar={pid.a_release:.0f}"),
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
