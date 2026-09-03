@@ -66,7 +66,6 @@ CONF = 0.25               # YOLO 置信度
 IMGSZ = 640               # YOLO 输入尺寸
 
 ROI_PAD = 60              # UI 框外扩，避免鱼/条贴边被裁
-UI_DETECT_STABLE = 3      # 未锁定时连续几次检测到 UI 才锁定
 UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定位
 UI_MIN_SCORE = 0.55       # UI 模板匹配阈值（调高更不容易误锁）
@@ -399,6 +398,17 @@ def yolo_detect(frame, imgsz):
     return fish_pt, bar_box
 
 
+def detect_objects(frame):
+    """按当前 detect_mode 在 frame(局部坐标) 上检测，返回 (fish_pt, bar_box)。"""
+    if detect_mode == "cv":
+        return cv_detect.detect(frame, cv_fish_tpl)
+    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
+    if detect_mode == "mixed":
+        cv_bar = cv_detect.detect_bar(frame)
+        return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
+    return yolo_fish, yolo_bar
+
+
 # ====================== PID 控制器 ======================
 def _linfit_slope(points):
     """对 (t, y) 点列做速度拟合，返回斜率(px/s)。
@@ -592,7 +602,6 @@ def main():
         dbg_log.clear()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
-    ui_hits = 0          # 未锁定阶段的连续命中次数
     ui_miss = 0          # 锁定阶段复检失败次数
     frame_idx = 0
 
@@ -631,52 +640,52 @@ def main():
 
                 # ---------- 截图范围 ----------
                 if ui_rect is None:
-                    # 未锁定：全屏截图，同时找 UI
+                    # 未锁定：全屏截图，先找可疑 UI
                     frame, ox, oy = grab_screen(sct, None)
-                    do_ui_check = True
                 else:
                     # 已锁定：只截 UI 框(外扩)内的画面
                     x, y, w, h = ui_rect
                     frame, ox, oy = grab_screen(
                         sct, (x - ROI_PAD, y - ROI_PAD, w + ROI_PAD * 2, h + ROI_PAD * 2)
                     )
-                    # 定期复检 UI 是否还在
-                    do_ui_check = (frame_idx % UI_RECHECK_EVERY == 0)
+                do_ui_check = (frame_idx % UI_RECHECK_EVERY == 0)
 
-                # ---------- 目标检测（CV 模板 / YOLO，F6 切换） ----------
-                if detect_mode == "cv":
-                    fish_pt, bar_box = cv_detect.detect(frame, cv_fish_tpl)
-                else:
-                    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
-                    if detect_mode == "mixed":
-                        cv_bar = cv_detect.detect_bar(frame)
-                        fish_pt = yolo_fish
-                        bar_box = cv_bar if cv_bar is not None else yolo_bar
+                # ---------- 检测与 UI 锁定 ----------
+                fish_pt = bar_box = None
+                if ui_rect is None:
+                    # 思路：全屏模板找可疑 UI -> 只对可疑框做检测 -> 发现鱼才锁定
+                    hit = locate_ui(frame) if tpl_ui is not None else None
+                    if hit is None:
+                        # 无模板/没命中：退化为全图检测（不锁定）
+                        fish_pt, bar_box = detect_objects(frame)
                     else:
-                        fish_pt, bar_box = yolo_fish, yolo_bar
-
-                # ---------- UI 模板：定位/锁定/复检 ----------
-                # 未锁定时要求“模板命中 + 本帧有鱼或条”才计数，避免误锁空 UI
-                if tpl_ui is not None and do_ui_check:
-                    hit = locate_ui(frame)
-                    if hit is not None:
                         hx, hy, hw, hh = hit
-                        hit_screen = (ox + hx, oy + hy, hw, hh)
-                        if ui_rect is None:
-                            if fish_pt is not None or bar_box is not None:
-                                ui_hits += 1
-                                if ui_hits >= UI_DETECT_STABLE:
-                                    ui_rect = hit_screen
-                                    ui_hits = 0
-                                    print("UI 已锁定，只截取 UI 区域")
-                            else:
-                                ui_hits = 0
-                        else:
-                            ui_rect = hit_screen   # 位置有漂移时顺带修正
+                        pad = 20
+                        x1 = max(0, hx - pad)
+                        y1 = max(0, hy - pad)
+                        x2 = min(frame.shape[1], hx + hw + pad)
+                        y2 = min(frame.shape[0], hy + hh + pad)
+                        crop = frame[y1:y2, x1:x2]
+                        f, b = detect_objects(crop)
+                        if f is not None:
+                            # 候选框里真有鱼 -> 锁这个 UI
+                            ui_rect = (ox + hx, oy + hy, hw, hh)
                             ui_miss = 0
-                    else:
-                        if ui_rect is None:
-                            ui_hits = 0
+                            print("UI 锁定（候选框内发现鱼）")
+                            fish_pt = (x1 + f[0], y1 + f[1])
+                            if b is not None:
+                                bar_box = (x1 + b[0], y1 + b[1],
+                                           x1 + b[2], y1 + b[3])
+                        # 候选框内没鱼：不锁定，也不浪费全图检测
+                else:
+                    # 锁定后：整帧已经是 UI 区域，直接检测
+                    fish_pt, bar_box = detect_objects(frame)
+                    if do_ui_check and tpl_ui is not None:
+                        hit = locate_ui(frame)
+                        if hit is not None:
+                            ui_rect = (ox + hit[0], oy + hit[1],
+                                       hit[2], hit[3])
+                            ui_miss = 0
                         else:
                             ui_miss += 1
                             if ui_miss >= UI_MAX_MISS:
