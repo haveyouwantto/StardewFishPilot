@@ -99,6 +99,7 @@ MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟
 SMOOTH_ALPHA = 0.70      # 位置低通（越大越跟手；0.5 偏平滑但迟滞大）
 LARGE_ERR_PX = 55.0      # 大误差阈值
 LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
+ZONE_MARGIN_PX = 8.0     # 鱼超出条边界这么多 px 就全速追，不再微调
 VEL_WINDOW_S = 0.10      # bar 速度估计窗口（短=跟手）
 FISH_WINDOW_S = 0.10     # 鱼速度估计窗口
 VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手、噪声越大）
@@ -572,21 +573,28 @@ class FishPID:
         # 用 bar 速度外推一小段：上升过快时误差提前转正，提前松手防过冲
         e = self.fish_filt - (self.bar_filt +
                               self.v_bar * BAR_LOOKAHEAD_S)
-        e_p = e if abs(e) >= DEADBAND_PX else 0.0
-        u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
-             KFF * self.v_fish)
-        if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
-            u *= LARGE_ERR_BOOST
         self.err = e
-        self.target_v = u
 
         prev = self.last_action if self.last_action is not None else False
-        if u < -HYST_U:
-            want = True
-        elif u > HYST_U:
-            want = False
+        # 鱼跑出绿色条范围：全速追，不做微调（解决“鱼跑了还犹豫”）
+        half = bar_h / 2 if bar_h > 0 else 45.0
+        if self.fish_filt < self.bar_filt - half - ZONE_MARGIN_PX:
+            want = True                      # 鱼在条上方 -> 按住追
+        elif self.fish_filt > self.bar_filt + half + ZONE_MARGIN_PX:
+            want = False                     # 鱼在条下方 -> 松开追
         else:
-            want = prev
+            e_p = e if abs(e) >= DEADBAND_PX else 0.0
+            u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
+                 KFF * self.v_fish)
+            if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
+                u *= LARGE_ERR_BOOST
+            self.target_v = u
+            if u < -HYST_U:
+                want = True
+            elif u > HYST_U:
+                want = False
+            else:
+                want = prev
         # 最短切换间隔
         if want != prev:
             if t - self.last_switch_t < MIN_SWITCH_S:
