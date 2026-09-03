@@ -385,6 +385,9 @@ def update_overlay(info):
             fx, fy = info["fish_pt"]
             circle(fx, fy, 8, win32api.RGB(80, 160, 255), 3)
             text(fx + 10, fy - 8, "FISH", win32api.RGB(80, 160, 255))
+        if info.get("fish_box"):
+            x1, y1, x2, y2 = info["fish_box"]
+            rect(x1, y1, x2 - x1, y2 - y1, win32api.RGB(80, 160, 255), 2)
     finally:
         _f = locals().get("font")
         _o = locals().get("old_font")
@@ -437,13 +440,15 @@ def yolo_detect(frame, imgsz):
     for (x1, y1, x2, y2), conf, cls in zip(xyxy, confs, clss):
         if cls == 1:            # fish
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-            if best_fish is None or conf > best_fish[2]:
-                best_fish = (cx, cy, float(conf))
+            if best_fish is None or conf > best_fish[6]:
+                best_fish = (cx, cy, float(x1), float(y1),
+                             float(x2), float(y2), float(conf))
         elif cls == 0:          # bar
             if best_bar is None or conf > best_bar[4]:
                 best_bar = (x1, y1, x2, y2, float(conf))
 
-    fish_pt = (best_fish[0], best_fish[1]) if best_fish else None
+    fish_pt = (best_fish[0], best_fish[1], best_fish[2], best_fish[3],
+               best_fish[4], best_fish[5]) if best_fish else None
     bar_box = best_bar[:4] if best_bar else None
     return fish_pt, bar_box
 
@@ -455,7 +460,8 @@ def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True):
     yolo_fish, yolo_bar = yolo_detect(frame, imgsz)
     if detect_mode == "mixed" and use_cv_bar:
         cv_bar = cv_detect.detect_bar(
-            frame, fish=yolo_fish)
+            frame,
+            fish_y_range=(yolo_fish[3], yolo_fish[5]) if yolo_fish else None)
         return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
     return yolo_fish, yolo_bar
 
@@ -880,6 +886,11 @@ def main():
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
+                        if len(fish_pt) >= 4:
+                            info["fish_box"] = (
+                                ox + fish_pt[2], oy + fish_pt[3],
+                                ox + fish_pt[4], oy + fish_pt[5],
+                            )
                     if bar_box is not None:
                         info["bar_box"] = last_bar
                     update_overlay(info)
