@@ -57,6 +57,10 @@ USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quanti
 # ====================== 配置 ======================
 DETECT_MODE = "mixed"     # "mixed"=鱼YOLO+条传统(推荐)  "cv"/"yolo" 备用
 DETECT_CHOICES = ("cv", "mixed", "yolo")
+USE_RL = True             # True: 用 rl_fishing 训练的策略；False: 用 PDM-PID
+RL_PROGRESS = 0.30        # 暂未读游戏进度条，用训练起始附近固定估计
+RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 一致
+RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 一致
 
 HOLD_KEY = "c"
 FPS_TARGET = 40           # 运行帧率上限
@@ -116,6 +120,7 @@ tpl_ui = None
 cv_fish_tpl = None
 detect_mode = DETECT_MODE
 yolo_engine_name = "CUDA"
+rl_policy = None
 
 
 def on_press(key):
@@ -409,6 +414,52 @@ def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True):
     return yolo_fish, yolo_bar
 
 
+# ====================== RL 策略（可选控制） ======================
+class RLPolicy:
+    def __init__(self, path):
+        from stable_baselines3 import PPO
+
+        self.model = PPO.load(str(path), device="cpu")
+
+    def decide(self, obs):
+        act = self.model.predict(obs.reshape(1, -1), deterministic=True)[0][0]
+        return bool(int(act))
+
+
+def load_rl_policy():
+    global rl_policy
+    if not USE_RL:
+        return None
+    best = SCRIPT_DIR / "rl_fishing" / "models" / "best_model.zip"
+    path = best if best.exists() else (
+        SCRIPT_DIR / "rl_fishing" / "models" / "final_model.zip")
+    if not path.exists():
+        print("未找到 RL 模型，使用 PDM-PID")
+        return None
+    try:
+        rl_policy = RLPolicy(path)
+        print(f"RL 策略已加载: {path}")
+        return rl_policy
+    except Exception as exc:
+        print(f"RL 加载失败，使用 PDM-PID: {exc}")
+        return None
+
+
+def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
+    """与训练环境一致的观测：位置按 UI 高度归一化，速度换算成 60Hz px/tick。"""
+    x, y, w, h = ui_rect
+    th = max(1.0, float(h))
+    pos_f = float(np.clip((fish_y - y) / th, 0.0, 1.0))
+    pos_b = float(np.clip((bar_cy - y) / th, 0.0, 1.0))
+    k = RL_POND / (th * 60.0 * RL_VEL_SCALE)
+    vel_f = float(np.clip(pid.v_fish * k, -1.0, 1.0))
+    vel_b = float(np.clip(pid.v_bar * k, -1.0, 1.0))
+    return np.array(
+        [pos_b, vel_b, pos_f, vel_f, RL_PROGRESS, float(prev_action)],
+        dtype=np.float32,
+    )
+
+
 # ====================== PID 控制器 ======================
 def _linfit_slope(points):
     """对 (t, y) 点列做速度拟合，返回斜率(px/s)。
@@ -554,7 +605,9 @@ def main():
     is_holding = False
     was_running = False
     pid = FishPID()
-    print(f"控制: PID   检测: {detect_mode.upper()}（F6 可切换）")
+    rl = load_rl_policy()
+    print(f"控制: {'RL' if rl is not None else 'PDM-PID'}   检测: "
+          f"{detect_mode.upper()}（F6 可切换）")
     dbg_log = []
     dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
@@ -697,17 +750,32 @@ def main():
                     fish_mem = bar_mem = 0
                     print("UI 释放（长时间未检测到鱼）")
 
-                # ---------- PID 按键控制 ----------
+                # ---------- 按键控制（RL / PDM-PID） ----------
                 ctrl_t = time.perf_counter()
+                ctrl_tag = "PID"
                 if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    act = pid.control(
-                        ctrl_t,
-                        bar_cy,
-                        last_fish[1],
-                        bar_seen=bar_seen_now,
-                        fish_seen=fish_seen_now,
-                    )
+                    if rl is not None and ui_rect is not None:
+                        ctrl_tag = "RL"
+                        pid.observe(ctrl_t, bar_cy, last_fish[1],
+                                    bar_seen=bar_seen_now,
+                                    fish_seen=fish_seen_now)
+                        obs = rl_make_obs(last_fish[1], bar_cy, ui_rect,
+                                          pid, int(is_holding))
+                        press_now = rl.decide(obs)
+                        pid.err = last_fish[1] - bar_cy     # 仅显示用
+                        pid.target_v = 0.0
+                    else:
+                        duty = pid.control(
+                            ctrl_t,
+                            bar_cy,
+                            last_fish[1],
+                            bar_seen=bar_seen_now,
+                            fish_seen=fish_seen_now,
+                        )
+                        press_now = (duty > 0 and
+                                     (ctrl_t % PDM_CYCLE_S) <
+                                     duty * PDM_CYCLE_S)
                     dbg_log.append(
                         [
                             f"{ctrl_t:.3f}",
@@ -715,7 +783,7 @@ def main():
                             f"{bar_cy:.1f}",
                             f"{pid.v_fish:.1f}",
                             f"{pid.v_bar:.1f}",
-                            "1" if act > 0 and (ctrl_t % PDM_CYCLE_S) < act * PDM_CYCLE_S else "0",
+                            "1" if press_now else "0",
                             "1" if is_holding else "0",
                             f"{ui_rect[3]:.0f}" if ui_rect else "0",
                             "1" if fish_seen_now else "0",
@@ -724,9 +792,6 @@ def main():
                     )
                     if len(dbg_log) >= 500:
                         flush_dbg_log()
-                    # PDM：按压力度 act 在 PDM_CYCLE_S 周期内转成占空比
-                    press_now = (act > 0 and
-                                 (ctrl_t % PDM_CYCLE_S) < act * PDM_CYCLE_S)
                     if press_now and not is_holding:
                         keyboard.press(HOLD_KEY)
                         is_holding = True
@@ -748,7 +813,8 @@ def main():
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
                                 f"key={'HOLD' if is_holding else 'rel '} "
-                                f"fs={int(fish_seen_now)} bs={int(bar_seen_now)}"),
+                                f"fs={int(fish_seen_now)} bs={int(bar_seen_now)} "
+                                f"ctrl={ctrl_tag}"),
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
