@@ -26,6 +26,7 @@ Stardew Valley Auto Fishing Bot - YOLO 版
   3) yolov8n.pt (仅演示，请先训练)
 """
 
+import argparse
 import sys
 import time
 from collections import deque
@@ -620,7 +621,16 @@ def should_hold_simple(bar_box, fish_y):
 
 # ====================== 主循环 ======================
 def main():
-    global running, exit_flag
+    global running, exit_flag, ctrl_mode
+
+    ap = argparse.ArgumentParser(description="星露谷自动钓鱼 - YOLO 版")
+    ap.add_argument(
+        "--mode",
+        choices=("rl", "pid", "simple"),
+        default="simple",
+        help="启动时的控制模式；运行中仍可用 F7 切换",
+    )
+    args = ap.parse_args()
 
     print("=" * 52)
     print("  星露谷自动钓鱼 - YOLO 版")
@@ -640,6 +650,14 @@ def main():
     was_running = False
     pid = FishPID()
     rl = load_rl_policy()
+    # 按启动参数预先选择模式（RL 不可用时自动回退 PID）
+    mode_map = {"rl": 0, "pid": 1, "simple": 2}
+    ctrl_mode = mode_map[args.mode]
+    if ctrl_mode == 0 and not has_rl:
+        print("RL 模型不可用，回退到 PID")
+        ctrl_mode = 1
+    mode_names = {0: "RL", 1: "PID", 2: "SIMPLE"}
+    print(f"启动控制模式: {mode_names[ctrl_mode]}（F7 可切换）")
     dbg_log = []
     dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
