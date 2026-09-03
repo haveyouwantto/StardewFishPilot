@@ -305,13 +305,12 @@ def update_overlay(info):
     hdc = win32gui.GetDC(hwnd_overlay)
     try:
         # 大号加粗字体（描边后更清晰）
-        logfont = {
-            "lfHeight": -24, "lfWidth": 0, "lfEscapement": 0,
-            "lfOrientation": 0, "lfWeight": 700, "lfItalic": 0,
-            "lfUnderline": 0, "lfStrikeOut": 0, "lfCharSet": 1,
-            "lfOutPrecision": 0, "lfClipPrecision": 0, "lfQuality": 4,
-            "lfPitchAndFamily": 0, "lfFaceName": "Microsoft YaHei UI",
-        }
+        logfont = win32gui.LOGFONT()
+        logfont.lfHeight = -24
+        logfont.lfWeight = 700
+        logfont.lfCharSet = 1
+        logfont.lfQuality = 4
+        logfont.lfFaceName = "Microsoft YaHei UI"
         font = win32gui.CreateFontIndirect(logfont)
         old_font = win32gui.SelectObject(hdc, font)
         br = win32gui.CreateSolidBrush(win32api.RGB(0, 0, 0))
