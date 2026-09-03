@@ -80,8 +80,8 @@ UI_DETECT_STABLE = 3      # 未锁定时连续几次检测到 UI 才锁定
 UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定位
 
-FISH_MEMORY_FRAMES = 8    # 鱼短暂漏检时沿用上一帧位置，避免误松键
-BAR_MEMORY_FRAMES = 8     # bar 短暂漏检时的容错
+FISH_MEMORY_FRAMES = 20   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
+BAR_MEMORY_FRAMES = 20    # bar 短暂漏检时的容错
 MAX_FISH_STEP_PX = 160.0  # 鱼相邻帧最大位移，超过视为误检(跳变)忽略
 MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳变)忽略
 
@@ -484,6 +484,7 @@ class FishPID:
         self.fish_filt = None
         self.bar_filt = None
         self.last_switch_t = 0.0
+        self.fish_last_t = None
 
     def reset(self):
         self.bar_hist.clear()
@@ -495,6 +496,7 @@ class FishPID:
         self.fish_filt = None
         self.bar_filt = None
         self.last_switch_t = 0.0
+        self.fish_last_t = None
 
     @staticmethod
     def _push(hist, max_age, t, y):
@@ -510,7 +512,14 @@ class FishPID:
     def observe(self, t, bar_cy, fish_y, bar_seen, fish_seen):
         """只更新位置/速度估计（RL 模式也用它构造观测）。返回本帧 dt。"""
         if self.last_t is None or t - self.last_t > 0.5:
-            self.reset()
+            if self.last_t is None:
+                self.reset()
+            else:
+                # 长停顿只清历史/速度，保留位置滤波，恢复时不“畏畏缩缩”
+                self.bar_hist.clear()
+                self.fish_hist.clear()
+                self.v_bar = 0.0
+                self.v_fish = 0.0
             self.last_t = t
         dt = t - self.last_t
         self.last_t = t
@@ -535,8 +544,9 @@ class FishPID:
         dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
 
         # YOLO 偶发丢帧：不松手，用最后速度外推一小段，避免抖一下
-        if fish_seen:
+        if fish_seen and fish_y is not None:
             fy = float(fish_y)
+            self.fish_last_t = t
         elif self.fish_filt is not None:
             fy = self.fish_filt + self.v_fish * dt
         else:
@@ -824,8 +834,15 @@ def main():
                 # ---------- 按键控制（RL 或 PID） ----------
                 ctrl_t = time.perf_counter()
                 ctrl_tag = "PID"
-                if last_fish is not None and last_bar is not None:
+                # PID 模式：鱼短暂丢失时仍用内部滤波位置继续控制，不呆住
+                fish_ok = last_fish is not None
+                if not fish_ok and ctrl_mode == 1:
+                    fish_ok = (pid.fish_filt is not None and
+                               pid.fish_last_t is not None and
+                               ctrl_t - pid.fish_last_t < 1.2)
+                if last_bar is not None and fish_ok:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
+                    fish_y_arg = last_fish[1] if last_fish is not None else 0.0
                     if ctrl_mode == 2:
                         ctrl_tag = "SIMPLE"
                         bar_ctr = (last_bar[1] + last_bar[3]) / 2
@@ -860,7 +877,7 @@ def main():
                         act = pid.control(
                             ctrl_t,
                             bar_cy,
-                            last_fish[1],
+                            fish_y_arg,
                             bar_seen=bar_seen_now,
                             fish_seen=fish_seen_now,
                             bar_h=bar_h,
