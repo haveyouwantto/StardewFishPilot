@@ -7,6 +7,10 @@ Stardew Valley Auto Fishing Bot - YOLO 版
     锁定后只截取 UI 框区域给 YOLO，并按固定间隔复检 UI 是否还在
   - YOLO: 0=bar, 1=fish（与 yolo_dataset/data.yaml 一致）
 
+控制:
+  - 实时估计 bar / 鱼的速度，按刹车距离决定按/松时机（不冲过头）
+  - 贴近鱼时用 PID 微调悬停；加速度参数在线自适应
+
 性能:
   - 自动 CUDA 推理（可用时 FP16），支持同目录 best.onnx
   - 暂停时不截图、不推理，几乎不占 CPU
@@ -24,6 +28,7 @@ Stardew Valley Auto Fishing Bot - YOLO 版
 
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -64,6 +69,29 @@ UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定�
 
 FISH_MEMORY_FRAMES = 4    # 鱼短暂漏检时沿用上一帧位置，避免误松键
 BAR_MEMORY_FRAMES = 4     # bar 短暂漏检时的容错
+
+# ====================== PID 控制参数 ======================
+# 坐标约定: y 向下为正；bar 中心 > 鱼 y 表示 bar 在鱼下方。
+# 控制器先估计 bar / 鱼的速度(px/s)，再由 PID 算出目标速度，
+# 用“实测 bar 速度 vs 目标速度”决定按/松的时机，避免只看位置冲过头。
+KP = 2.5                 # 位置增益：误差 1px ≈ 目标速度多 2.5px/s
+KI = 0.12                # 积分增益，消除持续偏差
+KD = 0.20                # 阻尼项（鱼与 bar 的相对速度），抑制过冲
+VEL_BAND = 12.0          # 速度死区 px/s，避免按键抖动
+INTEGRAL_LIMIT = 300.0   # 积分限幅
+FISH_LOOKAHEAD_S = 0.12  # 用鱼的速度外推一小段，提前反应
+VEL_WINDOW_S = 0.10      # bar 速度估计的滑动窗口（秒）
+FISH_WINDOW_S = 0.16     # 鱼速度估计的滑动窗口（秒）
+VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手）
+MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
+A_PRESS_SEED = 1600.0    # 按住时加速度估计初值 px/s^2（运行中自适应）
+A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
+ACCEL_ALPHA = 0.12       # 加速度估计的学习率
+CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
+PRED_MARGIN_PX = 6.0     # 刹车距离预测的提前余量 px
+SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
+MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
+MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
 
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
@@ -273,6 +301,9 @@ def update_overlay(info):
         tag = f"  {fps:.0f} FPS" if fps > 0 else ""
         text(16, 16, f"[F8] {st}  [F9] Quit  {engine_name}{tag}", col)
 
+        if info.get("dbg"):
+            text(16, 40, info["dbg"], win32api.RGB(255, 255, 255))
+
         if info.get("ui"):
             x, y, w, h = info["ui"]
             rect(x, y, w, h, win32api.RGB(0, 255, 255), 2)
@@ -343,16 +374,144 @@ def yolo_detect(frame, imgsz):
     return fish_pt, bar_box
 
 
-def should_hold(bar_box, fish_y):
-    """鱼在条内 -> 不按键；鱼在条上方 -> 按住(条上升)；在下方 -> 松开(条下降)。"""
-    if bar_box is None or fish_y is None:
-        return False
-    x1, y1, x2, y2 = bar_box
-    top, bottom, center = y1, y2, (y1 + y2) / 2
-    margin = max(3.0, (bottom - top) * 0.10)
-    if top + margin <= fish_y <= bottom - margin:
-        return False
-    return fish_y < center
+# ====================== PID 控制器 ======================
+def _linfit_slope(points):
+    """对 (t, y) 点列做最小二乘，返回斜率(px/s)；点数不足返回 None。"""
+    n = len(points)
+    if n < 3:
+        return None
+    sx = sy = sxx = sxy = 0.0
+    t0 = points[0][0]
+    for t, y in points:
+        x = t - t0
+        sx += x
+        sy += y
+        sxx += x * x
+        sxy += x * y
+    den = n * sxx - sx * sx
+    if den <= 1e-9:
+        return None
+    return (n * sxy - sx * sy) / den
+
+
+class FishPID:
+    """速度预测 + 刹车时机 + PID 微调控制器。
+
+    - bar / 鱼速度由滑动窗口拟合实时估计（v_bar、v_fish，向下为正 px/s）
+    - bar 远离鱼时：按住/松开让 bar 朝鱼加速，但用“刹车距离
+      v²/(2a)”预测什么时候该提前松手/按下，避免冲过头
+    - 鱼贴近 bar 中心时：用 PID 目标速度 u 做微调，平稳悬停
+    """
+
+    def __init__(self):
+        self.bar_hist = deque(maxlen=20)
+        self.fish_hist = deque(maxlen=14)
+        self.last_t = None
+        self.v_bar = 0.0      # 估计 bar 速度，向下为正 px/s
+        self.v_fish = 0.0     # 估计鱼速度
+        self.integral = 0.0
+        self.last_action = None   # True=按住 / False=松开
+        self.err = 0.0
+        self.target_v = 0.0
+        self.prev_v = None
+        self.a_press = A_PRESS_SEED     # 按住时的向上加速度大小
+        self.a_release = A_RELEASE_SEED  # 松开时的向下加速度大小
+
+    def reset(self):
+        self.bar_hist.clear()
+        self.fish_hist.clear()
+        self.last_t = None
+        self.v_bar = 0.0
+        self.v_fish = 0.0
+        self.integral = 0.0
+        self.last_action = None
+        self.prev_v = None
+        self.a_press = A_PRESS_SEED
+        self.a_release = A_RELEASE_SEED
+
+    @staticmethod
+    def _push(hist, max_age, t, y):
+        hist.append((t, y))
+        while len(hist) > 1 and t - hist[0][0] > max_age:
+            hist.popleft()
+
+    @staticmethod
+    def _smooth(old, raw):
+        v = old + VEL_ALPHA * (raw - old)
+        return max(-MAX_SPEED, min(MAX_SPEED, v))
+
+    def _update_accel(self, dt):
+        """根据同一按键状态下的速度变化率，在线估计两个方向的加速度。"""
+        if (self.prev_v is None or self.last_action is None or dt <= 1e-3):
+            self.prev_v = self.v_bar
+            return
+        a = (self.v_bar - self.prev_v) / dt
+        if self.last_action and a < -120:          # 按住时速度变向上(负)
+            mag = min(abs(a), 6000.0)
+            self.a_press += ACCEL_ALPHA * (mag - self.a_press)
+        elif not self.last_action and a > 120:     # 松开时速度变向下(正)
+            mag = min(a, 6000.0)
+            self.a_release += ACCEL_ALPHA * (mag - self.a_release)
+        self.prev_v = self.v_bar
+
+    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
+        """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
+        # 停顿过久(换局/动画)后清空历史，避免用旧数据
+        if self.last_t is None or t - self.last_t > 0.5:
+            self.reset()
+            self.last_t = t
+        dt = t - self.last_t
+        self.last_t = t
+        dt = max(1e-4, min(dt, 0.2))
+
+        if bar_seen:
+            self._push(self.bar_hist, VEL_WINDOW_S, t, bar_cy)
+        if fish_seen:
+            self._push(self.fish_hist, FISH_WINDOW_S, t, fish_y)
+
+        raw = _linfit_slope(self.bar_hist)
+        if raw is not None:
+            self.v_bar = self._smooth(self.v_bar, raw)
+        raw = _linfit_slope(self.fish_hist)
+        if raw is not None:
+            self.v_fish = self._smooth(self.v_fish, raw)
+
+        self._update_accel(dt)
+
+        # 用鱼的速度外推一小段距离，提前判断落点
+        fish_pred = fish_y + self.v_fish * FISH_LOOKAHEAD_S
+        e = fish_pred - bar_cy
+        self.err = e
+        self.integral = max(-INTEGRAL_LIMIT,
+                            min(INTEGRAL_LIMIT, self.integral + e * dt))
+        de = self.v_fish - self.v_bar
+        u = KP * e + KD * de + KI * self.integral + self.v_fish
+        self.target_v = u
+
+        action = self.last_action if self.last_action is not None else False
+        if e > CHASE_BAND_PX:                # 鱼在 bar 下方
+            if self.v_bar < -SPEED_EPS:      # bar 正在上冲：松开让其减速
+                action = False
+            elif self.v_bar > 0:             # 正在下坠：算按下后的刹车距离
+                stop = self.v_bar * self.v_bar / (2 * self.a_press)
+                action = True if e <= stop + PRED_MARGIN_PX else False
+            else:                            # 静止：松开开始下落
+                action = False
+        elif e < -CHASE_BAND_PX:             # 鱼在 bar 上方
+            if self.v_bar > SPEED_EPS:       # bar 正在下落：按住刹车并上冲
+                action = True
+            elif self.v_bar < 0:             # 正在上冲：算松开后的滑行距离
+                stop = self.v_bar * self.v_bar / (2 * self.a_release)
+                action = False if -e <= stop + PRED_MARGIN_PX else True
+            else:                            # 静止：按住开始上冲
+                action = True
+        else:                                # 贴近中心：PID 微调
+            if self.v_bar > u + VEL_BAND:
+                action = True                # 有点往下冲，按一下
+            elif self.v_bar < u - VEL_BAND:
+                action = False               # 上冲过头，松一下
+        self.last_action = action
+        return action
 
 
 # ====================== 主循环 ======================
@@ -372,6 +531,10 @@ def main():
     listener.start()
 
     is_holding = False
+    hold_since = None       # 当前这轮按住开始时刻
+    release_since = 0.0     # 上次松开时刻
+    was_running = False
+    pid = FishPID()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
     ui_hits = 0          # 未锁定阶段的连续命中次数
@@ -392,9 +555,14 @@ def main():
             while not exit_flag:
                 # ---------- 暂停：不截图、不推理 ----------
                 if not running:
+                    if was_running:
+                        pid.reset()          # 回来时速度历史已失效
+                        was_running = False
                     if is_holding:
                         keyboard.release(HOLD_KEY)
                         is_holding = False
+                        hold_since = None
+                        release_since = time.perf_counter()
                     if time.perf_counter() - last_paint >= 0.2:
                         update_overlay({"status": "PAUSED"})
                         last_paint = time.perf_counter()
@@ -403,6 +571,7 @@ def main():
                     continue
 
                 t0 = time.perf_counter()
+                was_running = True
                 frame_idx += 1
 
                 # ---------- 截图范围 ----------
@@ -465,18 +634,37 @@ def main():
                     if bar_mem > BAR_MEMORY_FRAMES:
                         last_bar = None
 
-                # ---------- 按键控制 ----------
+                # ---------- 按键控制（速度预测 + PID） ----------
+                ctrl_t = time.perf_counter()
                 if last_fish is not None and last_bar is not None:
-                    hold = should_hold(last_bar, last_fish[1])
-                    if hold and not is_holding:
-                        keyboard.press(HOLD_KEY)
-                        is_holding = True
-                    elif not hold and is_holding:
-                        keyboard.release(HOLD_KEY)
-                        is_holding = False
+                    bar_cy = (last_bar[1] + last_bar[3]) / 2
+                    act = pid.control(
+                        ctrl_t,
+                        bar_cy,
+                        last_fish[1],
+                        bar_seen=bar_box is not None,
+                        fish_seen=fish_pt is not None,
+                    )
+                    if act is True:
+                        if (not is_holding and
+                                ctrl_t - release_since >= MIN_RELEASE_S):
+                            keyboard.press(HOLD_KEY)
+                            is_holding = True
+                            hold_since = ctrl_t
+                            release_since = None
+                    elif act is False:
+                        if (is_holding and hold_since is not None and
+                                ctrl_t - hold_since >= MIN_HOLD_S):
+                            keyboard.release(HOLD_KEY)
+                            is_holding = False
+                            hold_since = None
+                            release_since = ctrl_t
+                    # act is None: 保持当前按键状态，减少抖动
                 elif is_holding:
                     keyboard.release(HOLD_KEY)
                     is_holding = False
+                    hold_since = None
+                    release_since = ctrl_t
 
                 # ---------- Overlay（限频重绘） ----------
                 now = time.perf_counter()
@@ -486,6 +674,8 @@ def main():
                         "status": "RUNNING",
                         "fps": fps,
                         "ui": ui_rect,
+                        "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
+                                f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f}"),
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
