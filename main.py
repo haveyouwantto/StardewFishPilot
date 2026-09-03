@@ -82,19 +82,17 @@ MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳�
 KP = 0.04                # 位置增益（参考项目 PD 参数）
 KD = 0.010               # 对 bar 自身速度的轻微阻尼（防过冲，不预测鱼）
 KFF = 0.0                # 关闭鱼速前馈（鱼速抖动会把 bar 带到鱼不会去的地方）
-DEADBAND_PX = 12.0       # 误差死区：鱼在 bar 中心 ±12px 内不动作
-HYST_U = 0.15            # 控制量迟滞
-MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟滞防抖）
+DEADBAND_PX = 6.0        # 误差死区：鱼在 bar 中心 ±6px 内不动作
+HYST_U = 0.02            # 最小按压力度阈值
 SMOOTH_ALPHA = 0.50      # 位置低通
 LARGE_ERR_PX = 55.0      # 大误差阈值
 LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
+PDM_CYCLE_S = 0.36       # PDM 周期：按压力度在周期内转成占空比
+PDM_GAIN = 0.30          # 控制量 → 按压力度的比例
 VEL_WINDOW_S = 0.15      # bar 速度估计窗口
 FISH_WINDOW_S = 0.15     # 鱼速度估计窗口
 VEL_ALPHA = 0.80         # 速度低通滤波系数
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
-MIN_HOLD_S = 0.05        # 每次按键最短按住时间
-MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
-
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
 TOGGLE_DETECT_HOTKEY = Key.f6   # 运行时切换 cv / YOLO 检测
@@ -454,7 +452,6 @@ class FishPID:
         self.target_v = 0.0
         self.fish_filt = None
         self.bar_filt = None
-        self.last_switch_t = 0.0
 
     def reset(self):
         self.bar_hist.clear()
@@ -465,7 +462,6 @@ class FishPID:
         self.last_action = None
         self.fish_filt = None
         self.bar_filt = None
-        self.last_switch_t = 0.0
 
     @staticmethod
     def _push(hist, max_age, t, y):
@@ -501,12 +497,11 @@ class FishPID:
         return dt
 
     def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
-        """每帧调用一次。返回 True=按住 / False=松开。"""
+        """每帧调用一次。返回 0~1 的按压力度（PDM 占空比）。"""
         self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
 
         if not bar_seen or not fish_seen:   # 与参考一致：丢一帧就松开
-            self.last_action = False
-            return False
+            return 0.0
 
         # 位置低通（参考 smooth_alpha=0.5）
         if self.fish_filt is None:
@@ -528,21 +523,13 @@ class FishPID:
         self.err = e
         self.target_v = u
 
-        prev = self.last_action if self.last_action is not None else False
+        # PDM：u<0(鱼在上方/需抬升) 时按压力度 = -u*GAIN，越不匹配按越久
         if u < -HYST_U:
-            want = True
-        elif u > HYST_U:
-            want = False
+            duty = min(1.0, -u * PDM_GAIN)
         else:
-            want = prev
-        # 最短切换间隔
-        if want != prev:
-            if t - self.last_switch_t < MIN_SWITCH_S:
-                want = prev
-            else:
-                self.last_switch_t = t
-        self.last_action = want
-        return want
+            duty = 0.0
+        self.last_action = duty
+        return duty
 
 
 # ====================== 主循环 ======================
@@ -562,8 +549,6 @@ def main():
     listener.start()
 
     is_holding = False
-    hold_since = None       # 当前这轮按住开始时刻
-    release_since = 0.0     # 上次松开时刻
     was_running = False
     pid = FishPID()
     print(f"控制: PID   检测: {detect_mode.upper()}（F6 可切换）")
@@ -608,8 +593,6 @@ def main():
                     if is_holding:
                         keyboard.release(HOLD_KEY)
                         is_holding = False
-                        hold_since = None
-                        release_since = time.perf_counter()
                     if time.perf_counter() - last_paint >= 0.2:
                         update_overlay({"status": "PAUSED"})
                         last_paint = time.perf_counter()
@@ -729,7 +712,7 @@ def main():
                             f"{bar_cy:.1f}",
                             f"{pid.v_fish:.1f}",
                             f"{pid.v_bar:.1f}",
-                            "1" if act else "0",
+                            "1" if act > 0 and (ctrl_t % PDM_CYCLE_S) < act * PDM_CYCLE_S else "0",
                             "1" if is_holding else "0",
                             f"{ui_rect[3]:.0f}" if ui_rect else "0",
                             "1" if fish_seen_now else "0",
@@ -738,26 +721,18 @@ def main():
                     )
                     if len(dbg_log) >= 500:
                         flush_dbg_log()
-                    if act is True:
-                        if (not is_holding and
-                                ctrl_t - release_since >= MIN_RELEASE_S):
-                            keyboard.press(HOLD_KEY)
-                            is_holding = True
-                            hold_since = ctrl_t
-                            release_since = None
-                    elif act is False:
-                        if (is_holding and hold_since is not None and
-                                ctrl_t - hold_since >= MIN_HOLD_S):
-                            keyboard.release(HOLD_KEY)
-                            is_holding = False
-                            hold_since = None
-                            release_since = ctrl_t
-                    # act is None: 保持当前按键状态，减少抖动
+                    # PDM：按压力度 act 在 PDM_CYCLE_S 周期内转成占空比
+                    press_now = (act > 0 and
+                                 (ctrl_t % PDM_CYCLE_S) < act * PDM_CYCLE_S)
+                    if press_now and not is_holding:
+                        keyboard.press(HOLD_KEY)
+                        is_holding = True
+                    elif not press_now and is_holding:
+                        keyboard.release(HOLD_KEY)
+                        is_holding = False
                 elif is_holding:
                     keyboard.release(HOLD_KEY)
                     is_holding = False
-                    hold_since = None
-                    release_since = ctrl_t
 
                 # ---------- Overlay（限频重绘） ----------
                 now = time.perf_counter()
