@@ -70,8 +70,8 @@ UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MIN_SCORE = 0.55       # UI 模板匹配阈值（调高更不容易误锁）
 UI_FISH_TIMEOUT_S = 1.5   # UI 锁定后，鱼持续这么久检测不到就解锁
 
-FISH_MEMORY_FRAMES = 12   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
-BAR_MEMORY_FRAMES = 12    # bar 短暂漏检时的容错
+FISH_MEMORY_FRAMES = 4    # 鱼短暂漏检时沿用上一帧位置
+BAR_MEMORY_FRAMES = 4     # bar 短暂漏检时的容错
 MAX_FISH_STEP_PX = 160.0  # 鱼相邻帧最大位移，超过视为误检(跳变)忽略
 MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳变)忽略
 
@@ -79,21 +79,21 @@ MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳�
 # 坐标约定: y 向下为正；e = 鱼 - bar 中心，鱼在上方时 e<0。
 # 控制律: u = kp*e + kd*(v_fish - v_bar) + kff*v_fish
 #         误差死区 -> 施密特迟滞 -> 最短切换，量化成 按住/松开
-KP = 0.06                # 位置增益：方向主要由位置误差决定
-KD = 0.01                # 阻尼（速度项在真实量级下容易带偏方向，调很小）
-KFF = 0.02               # 鱼速前馈（同样调小，避免鱼上游时误判为要按住）
-DEADBAND_PX = 6.0        # 误差死区（鱼在中心附近不动作）
-HYST_U = 0.30            # 控制量迟滞（越大切换越少，越平稳）
-MIN_SWITCH_S = 0.08      # 最短切换间隔：按/松至少持续 80ms，防止疯狂抖键
-SMOOTH_ALPHA = 0.55      # 位置低通（越小越平滑）
+KP = 0.04                # 位置增益（参考项目 PD 参数）
+KD = 0.18                # 阻尼（误差变化率）
+KFF = 0.08               # 鱼速前馈
+DEADBAND_PX = 2.0        # 误差死区
+HYST_U = 0.08            # 控制量迟滞
+MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟滞防抖）
+SMOOTH_ALPHA = 0.50      # 位置低通
 LARGE_ERR_PX = 55.0      # 大误差阈值
 LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
-VEL_WINDOW_S = 0.10      # bar 速度估计窗口（短=跟手）
-FISH_WINDOW_S = 0.10     # 鱼速度估计窗口
-VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手、噪声越大）
+VEL_WINDOW_S = 0.15      # bar 速度估计窗口
+FISH_WINDOW_S = 0.15     # 鱼速度估计窗口
+VEL_ALPHA = 0.80         # 速度低通滤波系数
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
-MIN_HOLD_S = 0.02        # 每次按键最短按住时间（帧间不抖键）
-MIN_RELEASE_S = 0.01     # 每次松开后的最短冷却
+MIN_HOLD_S = 0.05        # 每次按键最短按住时间
+MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
 
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
@@ -481,14 +481,7 @@ class FishPID:
     def observe(self, t, bar_cy, fish_y, bar_seen, fish_seen):
         """只更新位置/速度估计（RL 模式也用它构造观测）。返回本帧 dt。"""
         if self.last_t is None or t - self.last_t > 0.5:
-            if self.last_t is None:
-                self.reset()
-            else:
-                # 长停顿只清历史/速度，保留位置滤波，恢复时不“畏畏缩缩”
-                self.bar_hist.clear()
-                self.fish_hist.clear()
-                self.v_bar = 0.0
-                self.v_fish = 0.0
+            self.reset()
             self.last_t = t
         dt = t - self.last_t
         self.last_t = t
@@ -509,43 +502,34 @@ class FishPID:
 
     def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
         """每帧调用一次。返回 True=按住 / False=松开。"""
-        dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
+        self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
 
-        # YOLO 偶发丢帧：不松手，用最后速度外推一小段，避免抖一下
-        if fish_seen and fish_y is not None:
-            fy = float(fish_y)
-        elif self.fish_filt is not None:
-            fy = self.fish_filt + self.v_fish * dt
-        else:
-            fy = None
-        if bar_seen:
-            by = float(bar_cy)
-        elif self.bar_filt is not None:
-            by = self.bar_filt + self.v_bar * dt
-        else:
-            by = None
-        if fy is None or by is None:
+        if not bar_seen or not fish_seen:   # 与参考一致：丢一帧就松开
             self.last_action = False
             return False
 
         # 位置低通（参考 smooth_alpha=0.5）
-        self.fish_filt = (SMOOTH_ALPHA * fy +
-                          (1 - SMOOTH_ALPHA) * (self.fish_filt
-                                                if self.fish_filt is not None else fy))
-        self.bar_filt = (SMOOTH_ALPHA * by +
-                         (1 - SMOOTH_ALPHA) * (self.bar_filt
-                                               if self.bar_filt is not None else by))
+        if self.fish_filt is None:
+            self.fish_filt = float(fish_y)
+        else:
+            self.fish_filt = (SMOOTH_ALPHA * fish_y +
+                              (1 - SMOOTH_ALPHA) * self.fish_filt)
+        if self.bar_filt is None:
+            self.bar_filt = float(bar_cy)
+        else:
+            self.bar_filt = (SMOOTH_ALPHA * bar_cy +
+                             (1 - SMOOTH_ALPHA) * self.bar_filt)
 
         e = self.fish_filt - self.bar_filt
-        self.err = e
-
-        prev = self.last_action if self.last_action is not None else False
         e_p = e if abs(e) >= DEADBAND_PX else 0.0
         u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
              KFF * self.v_fish)
         if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
             u *= LARGE_ERR_BOOST
+        self.err = e
         self.target_v = u
+
+        prev = self.last_action if self.last_action is not None else False
         if u < -HYST_U:
             want = True
         elif u > HYST_U:
