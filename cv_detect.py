@@ -93,7 +93,7 @@ def detect_bar(frame_bgr, fish=None, band=None):
     lap = cv2.Laplacian(gray, cv2.CV_32F)
     tex = cv2.convertScaleAbs(lap)
 
-    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask, 4)
     comps = []
     min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
     for i in range(1, n):
@@ -107,15 +107,17 @@ def detect_bar(frame_bgr, fish=None, band=None):
         comps.append((int(x), int(y), int(w), int(h),
                       float(cent[i][0]), float(area), tex_mean))
 
-    # 合并：水平位置接近、垂直间隙小（鱼遮挡形成的空洞）的绿段归为同一 bar
+    # 合并：只把“x 范围有重叠”的上下两段归为同一 bar（不横向拓 x），
+    # 垂直间隙小说明是被鱼遮挡打断的同一条 bar
     groups = []
     for c in comps:
         placed = False
         for g in groups:
             for m in g:
-                dx = abs(c[4] - m[4])
+                x_overlap = (min(c[0] + c[2], m[0] + m[2]) -
+                             max(c[0], m[0]))
                 gap = max(0, m[1] - (c[1] + c[3]), c[1] - (m[1] + m[3]))
-                if dx <= max(20.0, fw * 0.15) and gap <= BAR_MERGE_GAP_PX:
+                if x_overlap > 0 and gap <= BAR_MERGE_GAP_PX:
                     g.append(c)
                     placed = True
                     break
