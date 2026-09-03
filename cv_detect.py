@@ -15,7 +15,9 @@ import cv2
 import numpy as np
 
 # ---------------- fish 模板匹配参数 ----------------
-FISH_SCALES = (0.8, 0.9, 1.0, 1.1, 1.2)
+# fish.png 是 1:1 小模板(19x20)，实际画面里鱼可能被 UI 缩放放大数倍，
+# 所以匹配时要按多档放大。若你的窗口缩放固定，可只保留对应档位提速。
+FISH_SCALES = (0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0)
 FISH_MIN_SCORE = 0.40          # 匹配分阈值，太低会误检
 
 # ---------------- bar 绿色矩形参数 ----------------
@@ -49,7 +51,10 @@ def detect_fish(frame_bgr, tpl_bgr):
         nw, nh = int(tw * s), int(th * s)
         if nw < 6 or nh < 6 or nw >= fw or nh >= fh:
             continue
-        r = cv2.resize(tpl, (nw, nh), interpolation=cv2.INTER_AREA)
+        # 像素画模板放大用最近邻，保持锯齿轮廓，避免插值模糊掉特征
+        interp = (cv2.INTER_NEAREST if nw > tw
+                  else cv2.INTER_AREA)
+        r = cv2.resize(tpl, (nw, nh), interpolation=interp)
         res = cv2.matchTemplate(gray, r, cv2.TM_CCOEFF_NORMED)
         _, max_v, _, max_loc = cv2.minMaxLoc(res)
         if best is None or max_v > best[0]:
