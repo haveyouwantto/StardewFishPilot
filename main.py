@@ -69,6 +69,7 @@ ROI_PAD = 60              # UI 框外扩，避免鱼/条贴边被裁
 UI_DETECT_STABLE = 3      # 未锁定时连续几次检测到 UI 才锁定
 UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定位
+UI_MIN_SCORE = 0.55       # UI 模板匹配阈值（调高更不容易误锁）
 
 FISH_MEMORY_FRAMES = 12   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
 BAR_MEMORY_FRAMES = 12    # bar 短暂漏检时的容错
@@ -250,7 +251,7 @@ def locate_ui(frame):
         if best is None or max_v > best[0]:
             best = (max_v, max_l[0] / fx, max_l[1] / fx, tw * s, th * s)
 
-    if best is None or best[0] < 0.45:
+    if best is None or best[0] < UI_MIN_SCORE:
         return None
     _, x, y, rw, rh = best
     return (int(x), int(y), int(rw), int(rh))
@@ -642,18 +643,34 @@ def main():
                     # 定期复检 UI 是否还在
                     do_ui_check = (frame_idx % UI_RECHECK_EVERY == 0)
 
+                # ---------- 目标检测（CV 模板 / YOLO，F6 切换） ----------
+                if detect_mode == "cv":
+                    fish_pt, bar_box = cv_detect.detect(frame, cv_fish_tpl)
+                else:
+                    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
+                    if detect_mode == "mixed":
+                        cv_bar = cv_detect.detect_bar(frame)
+                        fish_pt = yolo_fish
+                        bar_box = cv_bar if cv_bar is not None else yolo_bar
+                    else:
+                        fish_pt, bar_box = yolo_fish, yolo_bar
+
                 # ---------- UI 模板：定位/锁定/复检 ----------
+                # 未锁定时要求“模板命中 + 本帧有鱼或条”才计数，避免误锁空 UI
                 if tpl_ui is not None and do_ui_check:
                     hit = locate_ui(frame)
                     if hit is not None:
                         hx, hy, hw, hh = hit
                         hit_screen = (ox + hx, oy + hy, hw, hh)
                         if ui_rect is None:
-                            ui_hits += 1
-                            if ui_hits >= UI_DETECT_STABLE:
-                                ui_rect = hit_screen
+                            if fish_pt is not None or bar_box is not None:
+                                ui_hits += 1
+                                if ui_hits >= UI_DETECT_STABLE:
+                                    ui_rect = hit_screen
+                                    ui_hits = 0
+                                    print("UI 已锁定，只截取 UI 区域")
+                            else:
                                 ui_hits = 0
-                                print("UI 已锁定，只截取 UI 区域")
                         else:
                             ui_rect = hit_screen   # 位置有漂移时顺带修正
                             ui_miss = 0
@@ -666,18 +683,6 @@ def main():
                                 ui_rect = None
                                 ui_miss = 0
                                 print("UI 丢失，重新全屏定位")
-
-                # ---------- 目标检测（CV 模板 / YOLO，F6 切换） ----------
-                if detect_mode == "cv":
-                    fish_pt, bar_box = cv_detect.detect(frame, cv_fish_tpl)
-                else:
-                    yolo_fish, yolo_bar = yolo_detect(frame, IMGSZ)
-                    if detect_mode == "mixed":
-                        cv_bar = cv_detect.detect_bar(frame)
-                        fish_pt = yolo_fish
-                        bar_box = cv_bar if cv_bar is not None else yolo_bar
-                    else:
-                        fish_pt, bar_box = yolo_fish, yolo_bar
 
                 # ---------- 检测稳定性：短时记忆 + 跳变过滤 ----------
                 fish_seen_now = False
