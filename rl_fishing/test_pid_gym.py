@@ -59,17 +59,19 @@ def run_one(difficulty, behavior, eps=15, every=1, noise=0.0, delay=0,
 
 
 if __name__ == "__main__":
-    m.KP = 0.04
-    m.PDM_GAIN = 0.6
-    print("每格 = win/acc")
-    for every, tag in ((1, "60Hz"), (3, "20Hz")):
-        print(f"=== {tag} ===")
-        for noise in (0.0, 2.0, 5.0):
-            for delay in (0, 2, 4, 6):
-                row = []
-                for d, b in ((50, "mixed"), (50, "dart")):
-                    win, acc, k = run_one(d, b, eps=10, every=every,
-                                          noise=noise, delay=delay)
-                    row.append(f"{b[0]}{d}={win:.2f}/{acc:.2f}")
-                print(f"noise={noise:.0f}px delay={delay:2d}tick: "
-                      + "  ".join(row))
+    candidates = [
+        (0.04, 0.6, 6.0),   # 当前
+        (0.03, 0.6, 4.0),
+        (0.03, 0.7, 8.0),
+        (0.04, 0.7, 12.0),
+    ]
+    for kp, gain, db in candidates:
+        m.KP, m.PDM_GAIN, m.DEADBAND_PX = kp, gain, db
+        print(f"KP={kp} gain={gain} deadband={db:.0f}:")
+        for delay in (0, 2, 4):
+            row = []
+            for d, b in ((50, "mixed"), (50, "dart")):
+                win, acc, _ = run_one(d, b, eps=15, every=3,
+                                      noise=3.0, delay=delay)
+                row.append(f"{b[0]}50={win:.2f}/{acc:.2f}")
+            print(f"  delay={delay}: " + "  ".join(row))
