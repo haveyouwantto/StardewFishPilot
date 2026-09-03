@@ -89,6 +89,7 @@ MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳�
 KP = 0.04                # 位置增益（参考项目 PD 参数）
 KD = 0.18                # 阻尼（误差变化率）
 KFF = 0.08               # 鱼速前馈
+BAR_LOOKAHEAD_S = 0.12   # bar 速度外推提前量：上升过快时提前松手，防停在鱼上方
 DEADBAND_PX = 2.0        # 误差死区
 HYST_U = 0.08            # 控制量迟滞
 MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟滞防抖）
@@ -533,7 +534,9 @@ class FishPID:
                          (1 - SMOOTH_ALPHA) * (self.bar_filt
                                                if self.bar_filt is not None else by))
 
-        e = self.fish_filt - self.bar_filt
+        # 用 bar 速度外推一小段：上升过快时误差提前转正，提前松手防过冲
+        e = self.fish_filt - (self.bar_filt +
+                              self.v_bar * BAR_LOOKAHEAD_S)
         e_p = e if abs(e) >= DEADBAND_PX else 0.0
         u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
              KFF * self.v_fish)
