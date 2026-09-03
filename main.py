@@ -64,6 +64,8 @@ USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quanti
 CONTROL_MODE = "simple"
 
 HOLD_KEY = "c"
+SIMPLE_BAND = 12          # SIMPLE 迟滞带 px：按住中鱼低于中心 12px 才松，
+                         # 松开中鱼高于中心 12px 才按，避免疯狂抖键
 FPS_TARGET = 40           # 运行帧率上限
 PAUSE_POLL_S = 0.05       # 暂停时轮询间隔（不截图，CPU 占用几乎为 0）
 
@@ -90,18 +92,18 @@ KD = 0.35                # 阻尼项（鱼与 bar 的相对速度），抑制过
 VEL_BAND = 12.0          # 速度死区 px/s，避免按键抖动
 INTEGRAL_LIMIT = 300.0   # 积分限幅
 FISH_LOOKAHEAD_S = 0.12  # 用鱼的速度外推一小段，提前反应
-VEL_WINDOW_S = 0.25      # bar 速度估计的滑动窗口（秒，按实际低帧率放宽）
-FISH_WINDOW_S = 0.25     # 鱼速度估计的滑动窗口（秒）
-VEL_ALPHA = 0.60         # 速度低通滤波系数（越大越跟手）
+VEL_WINDOW_S = 0.15      # bar 速度估计窗口：太大会让 PID 慢半拍
+FISH_WINDOW_S = 0.15     # 鱼速度估计窗口
+VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手、噪声越大）
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
-A_PRESS_SEED = 1600.0    # 按住时加速度估计初值 px/s^2（运行中自适应）
-A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
+A_PRESS_SEED = 2800.0    # 按住时加速度估计初值 px/s^2（运行中自适应）
+A_RELEASE_SEED = 900.0   # 松开时加速度估计初值 px/s^2
 ACCEL_ALPHA = 0.12       # 加速度估计的学习率
 CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
-PRED_MARGIN_PX = 10.0    # 刹车距离预测的提前余量 px
-ACTUATION_LAG_S = 0.07   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
-STOP_FACTOR = 1.5        # 刹车距离放大系数（>1 提前切键，防冲过头）
-SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
+MPC_HORIZON_S = 0.24     # 轨迹预测时长：把按/松两条轨迹各推演这么久再比较
+MPC_STEPS = 12           # 轨迹推演步数
+V_LIMIT_UP = 900.0       # 上升速度上限 px/s（推演用，防止轨迹发散）
+V_LIMIT_DOWN = 700.0     # 下落速度上限 px/s
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
 
@@ -417,10 +419,16 @@ def yolo_detect(frame, imgsz):
 
 # ====================== PID 控制器 ======================
 def _linfit_slope(points):
-    """对 (t, y) 点列做最小二乘，返回斜率(px/s)；点数不足返回 None。"""
+    """对 (t, y) 点列做速度拟合，返回斜率(px/s)。
+    只有 2 个点时直接用两点差分（最新一帧，滞后最小）。"""
     n = len(points)
-    if n < 3:
+    if n < 2:
         return None
+    if n == 2:
+        dt = points[1][0] - points[0][0]
+        if dt <= 1e-4:
+            return None
+        return (points[1][1] - points[0][1]) / dt
     sx = sy = sxx = sxy = 0.0
     t0 = points[0][0]
     for t, y in points:
@@ -517,7 +525,40 @@ class FishPID:
             self.v_fish = self._smooth(self.v_fish, raw)
         return dt
 
-    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
+    def _sim_end(self, action, y0, bar_h, top, bottom):
+        """把当前 bar 状态按给定按键推演 MPC_HORIZON_S，返回结束位置。"""
+        y = y0
+        v = self.v_bar
+        dt = MPC_HORIZON_S / MPC_STEPS
+        acc = -self.a_press if action else self.a_release
+        for _ in range(MPC_STEPS):
+            v += acc * dt
+            if action:
+                v = max(v, -V_LIMIT_UP)
+            else:
+                v = min(v, V_LIMIT_DOWN)
+            y += v * dt
+            if bar_h > 0:
+                y_min = top + bar_h / 2
+                y_max = bottom - bar_h / 2
+                if y < y_min:
+                    y, v = y_min, 0.0
+                elif y > y_max:
+                    y, v = y_max, 0.0
+        return y
+
+    def _mpc_action(self, bar_cy, fish_y, bar_h, top, bottom):
+        """比较“按住”与“松开”两条轨迹推演后的落点，选更接近鱼的。"""
+        y_hold = self._sim_end(True, bar_cy, bar_h, top, bottom)
+        y_rel = self._sim_end(False, bar_cy, bar_h, top, bottom)
+        d_hold = abs(y_hold - fish_y)
+        d_rel = abs(y_rel - fish_y)
+        if abs(d_hold - d_rel) <= 4.0:      # 差别很小：保持现状防抖
+            return self.last_action if self.last_action is not None else False
+        return d_hold <= d_rel
+
+    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen,
+                bar_h=0.0, top=0.0, bottom=0.0):
         """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
         dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
         self._update_accel(dt)
@@ -533,30 +574,10 @@ class FishPID:
         self.target_v = u
 
         action = self.last_action if self.last_action is not None else False
-        if e > CHASE_BAND_PX:                # 鱼在 bar 下方
-            if self.v_bar < -SPEED_EPS:      # bar 正在上冲：松开让其减速
-                action = False
-            elif self.v_bar > 0:             # 正在下坠：算按下后的刹车距离
-                # 若继续松手，延迟期间还会继续加速下坠
-                v_lag = self.v_bar
-                if not self.last_action:
-                    v_lag += self.a_release * ACTUATION_LAG_S
-                stop = STOP_FACTOR * v_lag * v_lag / (2 * self.a_press)
-                action = True if e <= stop + PRED_MARGIN_PX else False
-            else:                            # 静止：松开开始下落
-                action = False
-        elif e < -CHASE_BAND_PX:             # 鱼在 bar 上方
-            if self.v_bar > SPEED_EPS:       # bar 正在下落：按住刹车并上冲
-                action = True
-            elif self.v_bar < 0:             # 正在上冲：算松开后的滑行距离
-                # 若继续按住，延迟期间还会继续加速上冲
-                v_lag = self.v_bar
-                if self.last_action:
-                    v_lag -= self.a_press * ACTUATION_LAG_S
-                stop = STOP_FACTOR * v_lag * v_lag / (2 * self.a_release)
-                action = False if -e <= stop + PRED_MARGIN_PX else True
-            else:                            # 静止：按住开始上冲
-                action = True
+        if e > CHASE_BAND_PX or e < -CHASE_BAND_PX:
+            # 远离中心：轨迹推演决定按/松（会在中途提前减速，不冲过头）
+            target = fish_y + self.v_fish * MPC_HORIZON_S
+            action = self._mpc_action(bar_cy, target, bar_h, top, bottom)
         else:                                # 贴近中心：PID 微调
             if self.v_bar > u + VEL_BAND:
                 action = True                # 有点往下冲，按一下
@@ -619,18 +640,6 @@ def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
         [pos_b, vel_b, pos_f, vel_f, RL_PROGRESS, float(prev_action)],
         dtype=np.float32,
     )
-
-
-def should_hold_simple(bar_box, fish_y):
-    """响应式简单判断：鱼在 bar 中心上方就按住，下方就松开。
-    只留 ±5px 死区防抖，不再等鱼跑出条内才反应。"""
-    if bar_box is None or fish_y is None:
-        return False
-    x1, y1, x2, y2 = bar_box
-    center = (y1 + y2) / 2
-    if fish_y < center - 5:
-        return True
-    return False
 
 
 # ====================== 主循环 ======================
@@ -809,7 +818,13 @@ def main():
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
                     if ctrl_mode == 2:
                         ctrl_tag = "SIMPLE"
-                        act = should_hold_simple(last_bar, last_fish[1])
+                        bar_ctr = (last_bar[1] + last_bar[3]) / 2
+                        if is_holding:
+                            # 按住中：鱼落到中心下方超过带宽才松开
+                            act = last_fish[1] > bar_ctr + SIMPLE_BAND
+                        else:
+                            # 松开中：鱼升到中心上方超过带宽才按住
+                            act = last_fish[1] < bar_ctr - SIMPLE_BAND
                     elif rl is not None and ui_rect is not None and ctrl_mode == 0:
                         ctrl_tag = "RL"
                         pid.observe(
@@ -827,12 +842,20 @@ def main():
                         pid.target_v = 0.0
                     else:
                         ctrl_tag = "PID"
+                        bar_h = max(10.0, last_bar[3] - last_bar[1])
+                        if ui_rect is not None:
+                            top, bottom = ui_rect[1], ui_rect[1] + ui_rect[3]
+                        else:
+                            top, bottom = 0.0, float(screen_h)
                         act = pid.control(
                             ctrl_t,
                             bar_cy,
                             last_fish[1],
                             bar_seen=bar_seen_now,
                             fish_seen=fish_seen_now,
+                            bar_h=bar_h,
+                            top=top,
+                            bottom=bottom,
                         )
                     # 通用调试日志（任意模式都会记录）
                     if ui_rect is not None:
