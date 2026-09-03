@@ -67,8 +67,8 @@ IMGSZ = 640               # YOLO 输入尺寸
 
 ROI_PAD = 60              # UI 框外扩，避免鱼/条贴边被裁
 UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
-UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定位
 UI_MIN_SCORE = 0.55       # UI 模板匹配阈值（调高更不容易误锁）
+UI_FISH_TIMEOUT_S = 1.5   # UI 锁定后，鱼持续这么久检测不到就解锁
 
 FISH_MEMORY_FRAMES = 12   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
 BAR_MEMORY_FRAMES = 12    # bar 短暂漏检时的容错
@@ -82,10 +82,10 @@ MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳�
 KP = 0.06                # 位置增益：方向主要由位置误差决定
 KD = 0.01                # 阻尼（速度项在真实量级下容易带偏方向，调很小）
 KFF = 0.02               # 鱼速前馈（同样调小，避免鱼上游时误判为要按住）
-DEADBAND_PX = 2.0        # 误差死区
-HYST_U = 0.08            # 控制量迟滞
-MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟滞防抖）
-SMOOTH_ALPHA = 0.70      # 位置低通（越大越跟手；0.5 偏平滑但迟滞大）
+DEADBAND_PX = 6.0        # 误差死区（鱼在中心附近不动作）
+HYST_U = 0.30            # 控制量迟滞（越大切换越少，越平稳）
+MIN_SWITCH_S = 0.08      # 最短切换间隔：按/松至少持续 80ms，防止疯狂抖键
+SMOOTH_ALPHA = 0.55      # 位置低通（越小越平滑）
 LARGE_ERR_PX = 55.0      # 大误差阈值
 LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
 VEL_WINDOW_S = 0.10      # bar 速度估计窗口（短=跟手）
@@ -602,7 +602,7 @@ def main():
         dbg_log.clear()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
-    ui_miss = 0          # 锁定阶段复检失败次数
+    fish_seen_at = None  # 最近一次检测到鱼的时间(monotonic)
     frame_idx = 0
 
     last_fish = None     # 屏幕坐标 (x, y)，供漏检时沿用
@@ -670,7 +670,6 @@ def main():
                         if f is not None:
                             # 候选框里真有鱼 -> 锁这个 UI
                             ui_rect = (ox + hx, oy + hy, hw, hh)
-                            ui_miss = 0
                             print("UI 锁定（候选框内发现鱼）")
                             fish_pt = (x1 + f[0], y1 + f[1])
                             if b is not None:
@@ -685,13 +684,7 @@ def main():
                         if hit is not None:
                             ui_rect = (ox + hit[0], oy + hit[1],
                                        hit[2], hit[3])
-                            ui_miss = 0
-                        else:
-                            ui_miss += 1
-                            if ui_miss >= UI_MAX_MISS:
-                                ui_rect = None
-                                ui_miss = 0
-                                print("UI 丢失，重新全屏定位")
+                        # 复检没命中先不处理；鱼长时间消失才解锁
 
                 # ---------- 检测稳定性：短时记忆 + 跳变过滤 ----------
                 fish_seen_now = False
@@ -703,6 +696,7 @@ def main():
                         last_fish = cand_fish
                         fish_seen_now = True
                         fish_mem = 0
+                        fish_seen_at = t0
                 if not fish_seen_now:
                     fish_mem += 1
                     if fish_mem > FISH_MEMORY_FRAMES:
@@ -724,6 +718,15 @@ def main():
                     bar_mem += 1
                     if bar_mem > BAR_MEMORY_FRAMES:
                         last_bar = None
+
+                # UI 是否还在：鱼持续检测不到就算 UI 结束
+                if (ui_rect is not None and fish_seen_at is not None and
+                        time.perf_counter() - fish_seen_at > UI_FISH_TIMEOUT_S):
+                    ui_rect = None
+                    last_fish = None
+                    last_bar = None
+                    fish_mem = bar_mem = 0
+                    print("UI 释放（长时间未检测到鱼）")
 
                 # ---------- PID 按键控制 ----------
                 ctrl_t = time.perf_counter()
