@@ -104,6 +104,7 @@ MPC_HORIZON_S = 0.24     # 轨迹预测时长：把按/松两条轨迹各推演�
 MPC_STEPS = 12           # 轨迹推演步数
 V_LIMIT_UP = 900.0       # 上升速度上限 px/s（推演用，防止轨迹发散）
 V_LIMIT_DOWN = 700.0     # 下落速度上限 px/s
+EDGE_BAND_PX = 30.0      # 靠近轨道顶部/底部的边界判断带
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
 
@@ -553,18 +554,23 @@ class FishPID:
         y_rel = self._sim_end(False, bar_cy, bar_h, top, bottom)
         d_hold = abs(y_hold - fish_y)
         d_rel = abs(y_rel - fish_y)
-        if abs(d_hold - d_rel) <= 4.0:      # 差别很小：保持现状防抖
-            return self.last_action if self.last_action is not None else False
         return d_hold <= d_rel
 
     def control(self, t, bar_cy, fish_y, bar_seen, fish_seen,
                 bar_h=0.0, top=0.0, bottom=0.0):
         """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
         dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
-        self._update_accel(dt)
+        bar_top = bar_cy - bar_h / 2
+        bar_bot = bar_cy + bar_h / 2
+        at_edge = (bar_h > 0 and
+                   (bar_top <= top + EDGE_BAND_PX or
+                    bar_bot >= bottom - EDGE_BAND_PX))
+        if not at_edge:                     # 顶/底贴边时位置不变，加速度学不到
+            self._update_accel(dt)
 
         # 用鱼的速度外推一小段距离，提前判断落点
         fish_pred = fish_y + self.v_fish * FISH_LOOKAHEAD_S
+        target_long = fish_y + self.v_fish * MPC_HORIZON_S
         e = fish_pred - bar_cy
         self.err = e
         self.integral = max(-INTEGRAL_LIMIT,
@@ -576,13 +582,18 @@ class FishPID:
         action = self.last_action if self.last_action is not None else False
         if e > CHASE_BAND_PX or e < -CHASE_BAND_PX:
             # 远离中心：轨迹推演决定按/松（会在中途提前减速，不冲过头）
-            target = fish_y + self.v_fish * MPC_HORIZON_S
-            action = self._mpc_action(bar_cy, target, bar_h, top, bottom)
+            action = self._mpc_action(bar_cy, target_long, bar_h, top, bottom)
         else:                                # 贴近中心：PID 微调
             if self.v_bar > u + VEL_BAND:
                 action = True                # 有点往下冲，按一下
             elif self.v_bar < u - VEL_BAND:
                 action = False               # 上冲过头，松一下
+        # 边界兜底：到顶还按只会顶死，到底还松只会躺底
+        if bar_h > 0:
+            if bar_top <= top + EDGE_BAND_PX and target_long > bar_cy + 15:
+                action = False
+            elif bar_bot >= bottom - EDGE_BAND_PX and target_long < bar_cy - 15:
+                action = True
         self.last_action = action
         return action
 
