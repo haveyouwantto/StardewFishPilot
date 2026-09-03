@@ -13,3 +13,6 @@ yolov8n.pt
 
 # 训练中间权重（best.pt 已提交，last.pt 仅用于断点续训）
 yolo_runs/stardew_fish/weights/last.pt
+
+# RL 训练产物（可重新训练生成）
+rl_fishing/models/
