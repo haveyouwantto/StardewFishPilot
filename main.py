@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Stardew Valley Auto Fishing Bot - YOLO 版
+Stardew Valley Auto Fishing Bot
 
 检测:
   - UI 模板: 未锁定时全屏定位钓鱼 UI；连续几次稳定命中后锁定，
-    锁定后只截取 UI 框区域给 YOLO，并按固定间隔复检 UI 是否还在
-  - YOLO: 0=bar, 1=fish（与 yolo_dataset/data.yaml 一致）
+    锁定后只截取 UI 框区域，并按固定间隔复检 UI 是否还在
+  - mixed（默认）: 鱼用 YOLO，条用传统绿色矩形检测（缺条时回退 YOLO）
 
 控制:
-  - 默认用 rl_fishing 训练的 RL 策略（观测为归一化位置/速度/进度/上一动作）
-  - 无 RL 模型时回退到“速度预测 + 刹车时机 + PID 微调”
+  - 参考 PD：u = kp*e + kd*(vf-vb) + kff*vf，死区/迟滞/最短切换
 
 性能:
   - 自动 CUDA 推理（可用时 FP16），支持同目录 best.onnx
   - 暂停时不截图、不推理，几乎不占 CPU
   - Overlay 限频重绘
 
-热键: F8 开始/暂停, F7 切换控制模式, F6 切换 CV/YOLO 检测, F9 退出
+热键: F8 开始/暂停, F6 切换 CV/mixed/YOLO 检测, F9 退出
 依赖:
   pip install ultralytics opencv-python numpy mss pynput pywin32
 
@@ -26,7 +25,6 @@ Stardew Valley Auto Fishing Bot - YOLO 版
   3) yolov8n.pt (仅演示，请先训练)
 """
 
-import argparse
 import sys
 import time
 from collections import deque
@@ -57,18 +55,10 @@ except ImportError:
 USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quantize=16 表示 FP16
 
 # ====================== 配置 ======================
-# 启动默认控制模式（放在最上面，方便直接改）:
-#   "simple" = 旧版上下判断（最稳的基线）
-#   "pid"    = 速度预测 + PID
-#   "rl"     = rl_fishing 训练的策略
-# 命令行 --mode 或启动时菜单可以覆盖这里；运行中 F7 仍可切换。
-CONTROL_MODE = "simple"
-DETECT_MODE = "mixed"     # "cv"=全传统  "mixed"=鱼YOLO+条传统  "yolo"=全YOLO
+DETECT_MODE = "mixed"     # "mixed"=鱼YOLO+条传统(推荐)  "cv"/"yolo" 备用
 DETECT_CHOICES = ("cv", "mixed", "yolo")
 
 HOLD_KEY = "c"
-SIMPLE_BAND = 12          # SIMPLE 迟滞带 px：按住中鱼低于中心 12px 才松，
-                         # 松开中鱼高于中心 12px 才按，避免疯狂抖键
 FPS_TARGET = 40           # 运行帧率上限
 PAUSE_POLL_S = 0.05       # 暂停时轮询间隔（不截图，CPU 占用几乎为 0）
 
@@ -80,8 +70,8 @@ UI_DETECT_STABLE = 3      # 未锁定时连续几次检测到 UI 才锁定
 UI_RECHECK_EVERY = 20     # 锁定后每隔多少帧复检一次 UI 是否还在
 UI_MAX_MISS = 3           # 连续几次复检失败就解锁，重新全屏定位
 
-FISH_MEMORY_FRAMES = 20   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
-BAR_MEMORY_FRAMES = 20    # bar 短暂漏检时的容错
+FISH_MEMORY_FRAMES = 12   # 鱼短暂漏检时沿用上一帧位置（YOLO 丢帧容忍）
+BAR_MEMORY_FRAMES = 12    # bar 短暂漏检时的容错
 MAX_FISH_STEP_PX = 160.0  # 鱼相邻帧最大位移，超过视为误检(跳变)忽略
 MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳变)忽略
 
@@ -99,7 +89,6 @@ MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟
 SMOOTH_ALPHA = 0.70      # 位置低通（越大越跟手；0.5 偏平滑但迟滞大）
 LARGE_ERR_PX = 55.0      # 大误差阈值
 LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
-ZONE_MARGIN_PX = 8.0     # 鱼超出条边界这么多 px 就全速追，不再微调
 VEL_WINDOW_S = 0.10      # bar 速度估计窗口（短=跟手）
 FISH_WINDOW_S = 0.10     # 鱼速度估计窗口
 VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手、噪声越大）
@@ -107,20 +96,8 @@ MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
 MIN_HOLD_S = 0.02        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.01     # 每次松开后的最短冷却
 
-# ====================== RL 集成 ======================
-# 用 rl_fishing 里训练好的策略做按键决策（取代 PID）。
-# 观测与训练环境一致：[bar_y, bar_vel, fish_y, fish_vel, progress, prev_action]，
-# 位置按 UI 轨道高度归一化，速度按“虚拟池塘 568px、60Hz”换算。
-USE_RL = True
-RL_PROGRESS = 0.30        # 暂未读游戏进度条，先用训练初始值附近估计
-RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 保持一致
-RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 保持一致
-RL_TICK_HZ = 60.0
-RL_VEL_FACTOR = 0.35      # 真实游戏 bar 比训练环境快，先缩小速度避免观测饱和(0.35 可调)
-
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
-TOGGLE_HOTKEY = Key.f7    # 运行时切换 RL / PID
 TOGGLE_DETECT_HOTKEY = Key.f6   # 运行时切换 cv / YOLO 检测
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -141,12 +118,10 @@ tpl_ui = None
 cv_fish_tpl = None
 detect_mode = DETECT_MODE
 yolo_engine_name = "CUDA"
-has_rl = False            # 是否成功加载 RL 模型
-ctrl_mode = 2             # F7 循环: 0=RL 1=PID 2=SIMPLE；默认 SIMPLE 便于回退
 
 
 def on_press(key):
-    global running, exit_flag, ctrl_mode, detect_mode, engine_name
+    global running, exit_flag, detect_mode, engine_name
     try:
         if key == START_HOTKEY:
             running = not running
@@ -155,14 +130,6 @@ def on_press(key):
             exit_flag = True
             print("退出中...")
             return False
-        elif key == TOGGLE_HOTKEY:
-            for _ in range(3):          # 循环切换并跳过不可用的 RL
-                ctrl_mode = (ctrl_mode + 1) % 3
-                if ctrl_mode == 0 and not has_rl:
-                    continue
-                break
-            names = {0: "RL", 1: "PID", 2: "SIMPLE"}
-            print(f"控制模式: {names[ctrl_mode]}")
         elif key == TOGGLE_DETECT_HOTKEY:
             i = DETECT_CHOICES.index(detect_mode)
             detect_mode = DETECT_CHOICES[(i + 1) % len(DETECT_CHOICES)]
@@ -171,11 +138,6 @@ def on_press(key):
             print(f"检测模式: {detect_mode.upper()}")
     except Exception:
         pass
-
-
-def ctrl_mode_name():
-    names = {0: "RL", 1: "PID", 2: "SIMPLE"}
-    return names.get(ctrl_mode, "?")
 
 
 def find_weights():
@@ -362,9 +324,7 @@ def update_overlay(info):
         col = win32api.RGB(0, 255, 0) if st == "RUNNING" else win32api.RGB(255, 80, 80)
         fps = info.get("fps", 0)
         tag = f"  {fps:.0f} FPS" if fps > 0 else ""
-        mode = info.get("mode", "?")
-        text(16, 16,
-             f"[F8] {st}  [F7] {mode}  [F9] Quit  {engine_name}{tag}", col)
+        text(16, 16, f"[F8] {st}  [F9] Quit  {engine_name}{tag}", col)
 
         if info.get("dbg"):
             text(16, 40, info["dbg"], win32api.RGB(255, 255, 255))
@@ -485,7 +445,6 @@ class FishPID:
         self.fish_filt = None
         self.bar_filt = None
         self.last_switch_t = 0.0
-        self.fish_last_t = None
 
     def reset(self):
         self.bar_hist.clear()
@@ -497,7 +456,6 @@ class FishPID:
         self.fish_filt = None
         self.bar_filt = None
         self.last_switch_t = 0.0
-        self.fish_last_t = None
 
     @staticmethod
     def _push(hist, max_age, t, y):
@@ -539,15 +497,13 @@ class FishPID:
             self.v_fish = self._smooth(self.v_fish, raw)
         return dt
 
-    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen,
-                bar_h=0.0, top=0.0, bottom=0.0):
+    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
         """每帧调用一次。返回 True=按住 / False=松开。"""
         dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
 
         # YOLO 偶发丢帧：不松手，用最后速度外推一小段，避免抖一下
         if fish_seen and fish_y is not None:
             fy = float(fish_y)
-            self.fish_last_t = t
         elif self.fish_filt is not None:
             fy = self.fish_filt + self.v_fish * dt
         else:
@@ -576,25 +532,18 @@ class FishPID:
         self.err = e
 
         prev = self.last_action if self.last_action is not None else False
-        # 鱼跑出绿色条范围：全速追，不做微调（解决“鱼跑了还犹豫”）
-        half = bar_h / 2 if bar_h > 0 else 45.0
-        if self.fish_filt < self.bar_filt - half - ZONE_MARGIN_PX:
-            want = True                      # 鱼在条上方 -> 按住追
-        elif self.fish_filt > self.bar_filt + half + ZONE_MARGIN_PX:
-            want = False                     # 鱼在条下方 -> 松开追
+        e_p = e if abs(e) >= DEADBAND_PX else 0.0
+        u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
+             KFF * self.v_fish)
+        if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
+            u *= LARGE_ERR_BOOST
+        self.target_v = u
+        if u < -HYST_U:
+            want = True
+        elif u > HYST_U:
+            want = False
         else:
-            e_p = e if abs(e) >= DEADBAND_PX else 0.0
-            u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
-                 KFF * self.v_fish)
-            if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
-                u *= LARGE_ERR_BOOST
-            self.target_v = u
-            if u < -HYST_U:
-                want = True
-            elif u > HYST_U:
-                want = False
-            else:
-                want = prev
+            want = prev
         # 最短切换间隔
         if want != prev:
             if t - self.last_switch_t < MIN_SWITCH_S:
@@ -605,77 +554,13 @@ class FishPID:
         return want
 
 
-# ====================== RL 策略（替代 PID 决策） ======================
-class RLPolicy:
-    """加载 rl_fishing/models 下的 PPO 策略。"""
-
-    def __init__(self, path):
-        from stable_baselines3 import PPO
-
-        self.model = PPO.load(str(path), device="cpu")
-
-    def decide(self, obs):
-        act = self.model.predict(obs.reshape(1, -1), deterministic=True)[0][0]
-        return bool(int(act))   # True=按住
-
-
-def load_rl_policy():
-    global has_rl
-    if not USE_RL:
-        print("USE_RL=False，控制模式: PID")
-        has_rl = False
-        return None
-    model_dir = SCRIPT_DIR / "rl_fishing" / "models"
-    best = model_dir / "best_model.zip"
-    path = best if best.exists() else model_dir / "final_model.zip"
-    if not path.exists():
-        print("未找到 RL 模型，控制模式: PID")
-        has_rl = False
-        return None
-    try:
-        rl = RLPolicy(path)
-        print(f"控制模式: RL（{path}）")
-        has_rl = True
-        return rl
-    except Exception as exc:
-        print(f"RL 模型加载失败，控制模式: PID（{exc}）")
-        has_rl = False
-        return None
-
-
-def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
-    """构造与训练环境一致的 6 维观测（真实像素 -> 虚拟池塘归一化）。"""
-    x, y, w, h = ui_rect
-    th = max(1.0, float(h))
-    pos_f = float(np.clip((fish_y - y) / th, 0.0, 1.0))
-    pos_b = float(np.clip((bar_cy - y) / th, 0.0, 1.0))
-    # 真实速度 px/s -> 虚拟速度(px/tick)，再按 VEL_SCALE 归一化；
-    # RL_VEL_FACTOR 用于补偿真实游戏与训练环境的绝对速度差异
-    k = RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE) * RL_VEL_FACTOR
-    vel_f = float(np.clip(pid.v_fish * k, -1.0, 1.0))
-    vel_b = float(np.clip(pid.v_bar * k, -1.0, 1.0))
-    return np.array(
-        [pos_b, vel_b, pos_f, vel_f, RL_PROGRESS, float(prev_action)],
-        dtype=np.float32,
-    )
-
-
 # ====================== 主循环 ======================
 def main():
-    global running, exit_flag, ctrl_mode
-
-    ap = argparse.ArgumentParser(description="星露谷自动钓鱼 - YOLO 版")
-    ap.add_argument(
-        "--mode",
-        choices=("rl", "pid", "simple"),
-        default=CONTROL_MODE,
-        help="启动时的控制模式；运行中仍可用 F7 切换",
-    )
-    args = ap.parse_args()
+    global running, exit_flag
 
     print("=" * 52)
     print("  星露谷自动钓鱼 - YOLO 版")
-    print("  F8 开始/暂停 | F7 切换控制 | F6 切换检测 | F9 退出")
+    print("  F8 开始/暂停 | F6 切换检测 | F9 退出")
     print("=" * 52)
 
     load_models()
@@ -690,16 +575,7 @@ def main():
     release_since = 0.0     # 上次松开时刻
     was_running = False
     pid = FishPID()
-    rl = load_rl_policy()
-    # 按启动参数预先选择模式（RL 不可用时自动回退 PID）
-    mode_map = {"rl": 0, "pid": 1, "simple": 2}
-    ctrl_mode = mode_map[args.mode]
-    if ctrl_mode == 0 and not has_rl:
-        print("RL 模型不可用，回退到 PID")
-        ctrl_mode = 1
-    mode_names = {0: "RL", 1: "PID", 2: "SIMPLE"}
-    print(f"启动控制模式: {mode_names[ctrl_mode]}（F7 可切换）  "
-          f"检测模式: {detect_mode.upper()}（F6 可切换）")
+    print(f"控制: PID   检测: {detect_mode.upper()}（F6 可切换）")
     dbg_log = []
     dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
@@ -710,8 +586,8 @@ def main():
         with open(dbg_log_path, "a", encoding="utf-8", newline="") as f:
             if first:
                 f.write(
-                    "t,algo,fish_y,bar_y,vf_px_s,vb_px_s,pos_f,pos_b,"
-                    "vel_f,vel_b,action,holding,ui_h,fish_seen,bar_seen\n"
+                    "t,fish_y,bar_y,vf_px_s,vb_px_s,action,holding,"
+                    "ui_h,fish_seen,bar_seen\n"
                 )
             for row in dbg_log:
                 f.write(",".join(row) + "\n")
@@ -745,8 +621,7 @@ def main():
                         hold_since = None
                         release_since = time.perf_counter()
                     if time.perf_counter() - last_paint >= 0.2:
-                        update_overlay({"status": "PAUSED",
-                                        "mode": ctrl_mode_name()})
+                        update_overlay({"status": "PAUSED"})
                         last_paint = time.perf_counter()
                         win32gui.PumpWaitingMessages()
                     time.sleep(PAUSE_POLL_S)
@@ -839,82 +714,24 @@ def main():
                     if bar_mem > BAR_MEMORY_FRAMES:
                         last_bar = None
 
-                # ---------- 按键控制（RL 或 PID） ----------
+                # ---------- PID 按键控制 ----------
                 ctrl_t = time.perf_counter()
-                ctrl_tag = "PID"
-                # PID 模式：鱼短暂丢失时仍用内部滤波位置继续控制，不呆住
-                fish_ok = last_fish is not None
-                if not fish_ok and ctrl_mode == 1:
-                    fish_ok = (pid.fish_filt is not None and
-                               pid.fish_last_t is not None and
-                               ctrl_t - pid.fish_last_t < 1.2)
-                if last_bar is not None and fish_ok:
+                if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    fish_y_arg = last_fish[1] if last_fish is not None else 0.0
-                    if ctrl_mode == 2:
-                        ctrl_tag = "SIMPLE"
-                        bar_ctr = (last_bar[1] + last_bar[3]) / 2
-                        if is_holding:
-                            # 按住中：鱼落到中心下方超过带宽才松开
-                            act = last_fish[1] > bar_ctr + SIMPLE_BAND
-                        else:
-                            # 松开中：鱼升到中心上方超过带宽才按住
-                            act = last_fish[1] < bar_ctr - SIMPLE_BAND
-                    elif rl is not None and ui_rect is not None and ctrl_mode == 0:
-                        ctrl_tag = "RL"
-                        pid.observe(
-                            ctrl_t,
-                            bar_cy,
-                            last_fish[1],
-                            bar_seen=bar_seen_now,
-                            fish_seen=fish_seen_now,
-                        )
-                        obs = rl_make_obs(
-                            last_fish[1], bar_cy, ui_rect, pid, int(is_holding)
-                        )
-                        act = rl.decide(obs)
-                        pid.err = last_fish[1] - bar_cy     # 仅用于显示
-                        pid.target_v = 0.0
-                    else:
-                        ctrl_tag = "PID"
-                        bar_h = max(10.0, last_bar[3] - last_bar[1])
-                        if ui_rect is not None:
-                            top, bottom = ui_rect[1], ui_rect[1] + ui_rect[3]
-                        else:
-                            top, bottom = 0.0, float(screen_h)
-                        act = pid.control(
-                            ctrl_t,
-                            bar_cy,
-                            fish_y_arg,
-                            bar_seen=bar_seen_now,
-                            fish_seen=fish_seen_now,
-                            bar_h=bar_h,
-                            top=top,
-                            bottom=bottom,
-                        )
-                    # 通用调试日志（任意模式都会记录）
-                    if ui_rect is not None:
-                        th = max(1.0, float(ui_rect[3]))
-                        k = (RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE)
-                             * RL_VEL_FACTOR)
-                        pos_f = np.clip((last_fish[1] - ui_rect[1]) / th, 0, 1)
-                        pos_b = np.clip((bar_cy - ui_rect[1]) / th, 0, 1)
-                        vel_f = np.clip(pid.v_fish * k, -1, 1)
-                        vel_b = np.clip(pid.v_bar * k, -1, 1)
-                    else:
-                        pos_f = pos_b = vel_f = vel_b = 0.0
+                    act = pid.control(
+                        ctrl_t,
+                        bar_cy,
+                        last_fish[1],
+                        bar_seen=bar_seen_now,
+                        fish_seen=fish_seen_now,
+                    )
                     dbg_log.append(
                         [
                             f"{ctrl_t:.3f}",
-                            ctrl_tag,
                             f"{last_fish[1]:.1f}",
                             f"{bar_cy:.1f}",
                             f"{pid.v_fish:.1f}",
                             f"{pid.v_bar:.1f}",
-                            f"{float(pos_f):.3f}",
-                            f"{float(pos_b):.3f}",
-                            f"{float(vel_f):.3f}",
-                            f"{float(vel_b):.3f}",
                             "1" if act else "0",
                             "1" if is_holding else "0",
                             f"{ui_rect[3]:.0f}" if ui_rect else "0",
@@ -952,7 +769,6 @@ def main():
                     info = {
                         "status": "RUNNING",
                         "fps": fps,
-                        "mode": ctrl_mode_name(),
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
