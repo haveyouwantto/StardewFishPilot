@@ -404,7 +404,7 @@ def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True):
     yolo_fish, yolo_bar = yolo_detect(frame, imgsz)
     if detect_mode == "mixed" and use_cv_bar:
         cv_bar = cv_detect.detect_bar(
-            frame, center_y=yolo_fish[1] if yolo_fish else None)
+            frame, fish=yolo_fish)
         return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
     return yolo_fish, yolo_bar
 

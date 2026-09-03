@@ -66,14 +66,15 @@ def detect_fish(frame_bgr, tpl_bgr):
     return (float(best[1]), float(best[2]))
 
 
-def detect_bar(frame_bgr, center_y=None, band=None):
+def detect_bar(frame_bgr, fish=None, band=None):
     """只在给定 y 附近找绿条（默认整帧搜索），返回 (x1,y1,x2,y2) 或 None。
     返回坐标始终是整帧坐标。"""
     if frame_bgr is None or frame_bgr.size == 0:
         return None
     fh, fw = frame_bgr.shape[:2]
     y0, y1 = 0, fh
-    if center_y is not None:
+    if fish is not None:
+        center_y = fish[1]
         band = band if band is not None else max(80.0, fh * BAR_Y_BAND_RATIO)
         y0 = max(0, int(center_y - band))
         y1 = min(fh, int(center_y + band))
@@ -92,6 +93,7 @@ def detect_bar(frame_bgr, center_y=None, band=None):
     min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
     best_area = 0.0
     best_box = None
+    candidates = []
     for c in cnts:
         area = cv2.contourArea(c)
         x, y, w, h = cv2.boundingRect(c)
@@ -102,15 +104,34 @@ def detect_bar(frame_bgr, center_y=None, band=None):
         aspect = h / w
         if aspect < BAR_ASPECT_MIN or aspect > BAR_ASPECT_MAX:
             continue
+        candidates.append((area, x, y, w, h))
+        if fish is not None:
+            # 硬约束：绿条垂直范围必须与鱼 y 有重叠（±60px），
+            # 水平中心也必须接近鱼 x，排除进度条/侧边绿块
+            y_overlap = (y - 60 <= fish[1] <= y + h + 60)
+            x_close = abs((x + w / 2) - fish[0]) <= max(60.0, fw * 0.3)
+            if not (y_overlap and x_close):
+                continue
         if area > best_area:
             best_area = area
             best_box = (float(x), float(y0 + y), float(x + w),
                         float(y0 + y + h))
+    if best_box is None and fish is not None and candidates:
+        # 鱼离条太远时退而求其次：选垂直距离最近的绿块，保证还能追
+        cx = fish[1]
+        best_d = None
+        best = None
+        for area, x, y, w, h in candidates:
+            dist = min(abs(cx - y), abs(cx - (y + h)))
+            if best_d is None or dist < best_d:
+                best_d = dist
+                best = (x, y0 + y, x + w, y0 + y + h)
+        best_box = best
     return best_box
 
 
 def detect(frame_bgr, fish_tpl):
     """一次返回 (fish_pt, bar_box)，与 yolo_detect 输出一致。"""
     fish = detect_fish(frame_bgr, fish_tpl)
-    bar = detect_bar(frame_bgr, center_y=fish[1] if fish else None)
+    bar = detect_bar(frame_bgr, fish=fish)
     return fish, bar
