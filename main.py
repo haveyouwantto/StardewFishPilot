@@ -99,8 +99,8 @@ A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
 ACCEL_ALPHA = 0.12       # 加速度估计的学习率
 CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
 PRED_MARGIN_PX = 10.0    # 刹车距离预测的提前余量 px
-ACTUATION_LAG_S = 0.04   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
-STOP_FACTOR = 1.15       # 刹车距离放大系数（>1 提前切键；过大容易追不上）
+ACTUATION_LAG_S = 0.07   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
+STOP_FACTOR = 1.5        # 刹车距离放大系数（>1 提前切键，防冲过头）
 SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
@@ -622,15 +622,15 @@ def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
 
 
 def should_hold_simple(bar_box, fish_y):
-    """旧版简单判断：鱼在条内不动；鱼在条上方按住、下方松开。"""
+    """响应式简单判断：鱼在 bar 中心上方就按住，下方就松开。
+    只留 ±5px 死区防抖，不再等鱼跑出条内才反应。"""
     if bar_box is None or fish_y is None:
         return False
     x1, y1, x2, y2 = bar_box
-    top, bottom, center = y1, y2, (y1 + y2) / 2
-    margin = max(3.0, (bottom - top) * 0.10)
-    if top + margin <= fish_y <= bottom - margin:
-        return False
-    return fish_y < center
+    center = (y1 + y2) / 2
+    if fish_y < center - 5:
+        return True
+    return False
 
 
 # ====================== 主循环 ======================
