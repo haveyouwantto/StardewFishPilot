@@ -149,6 +149,24 @@ class FishingEnv(gym.Env):
             dtype=np.float32,
         )
 
+    def debug_state(self) -> dict:
+        """供 watch/调试界面读取的本帧完整内部状态。"""
+        return {
+            "difficulty": self.difficulty,
+            "behavior": self.behavior,
+            "bar_size": self.bar_size,
+            "bar_pos": self.bar_pos,
+            "bar_vel": self.bar_vel,
+            "fish_pos": self.fish_pos,
+            "fish_vel": self.fish_vel,
+            "fish_base_vel": self.fish_base_vel,
+            "fish_target": self.fish_target,
+            "progress": self.progress,
+            "steps": self.steps,
+            "in_bar": self._was_in_bar(),
+            "last_action": self.last_action,
+        }
+
     # ---------------- Gym API ----------------
     def reset(self, *, seed: Optional[int] = None, options=None):
         super().reset(seed=seed)
