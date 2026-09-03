@@ -56,6 +56,13 @@ except ImportError:
 USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quantize=16 表示 FP16
 
 # ====================== 配置 ======================
+# 启动默认控制模式（放在最上面，方便直接改）:
+#   "simple" = 旧版上下判断（最稳的基线）
+#   "pid"    = 速度预测 + PID
+#   "rl"     = rl_fishing 训练的策略
+# 命令行 --mode 或启动时菜单可以覆盖这里；运行中 F7 仍可切换。
+CONTROL_MODE = "simple"
+
 HOLD_KEY = "c"
 FPS_TARGET = 40           # 运行帧率上限
 PAUSE_POLL_S = 0.05       # 暂停时轮询间隔（不截图，CPU 占用几乎为 0）
@@ -152,6 +159,11 @@ def on_press(key):
             print(f"控制模式: {names[ctrl_mode]}")
     except Exception:
         pass
+
+
+def ctrl_mode_name():
+    names = {0: "RL", 1: "PID", 2: "SIMPLE"}
+    return names.get(ctrl_mode, "?")
 
 
 def find_weights():
@@ -326,7 +338,9 @@ def update_overlay(info):
         col = win32api.RGB(0, 255, 0) if st == "RUNNING" else win32api.RGB(255, 80, 80)
         fps = info.get("fps", 0)
         tag = f"  {fps:.0f} FPS" if fps > 0 else ""
-        text(16, 16, f"[F8] {st}  [F9] Quit  {engine_name}{tag}", col)
+        mode = info.get("mode", "?")
+        text(16, 16,
+             f"[F8] {st}  [F7] {mode}  [F9] Quit  {engine_name}{tag}", col)
 
         if info.get("dbg"):
             text(16, 40, info["dbg"], win32api.RGB(255, 255, 255))
@@ -627,7 +641,7 @@ def main():
     ap.add_argument(
         "--mode",
         choices=("rl", "pid", "simple"),
-        default="simple",
+        default=CONTROL_MODE,
         help="启动时的控制模式；运行中仍可用 F7 切换",
     )
     args = ap.parse_args()
@@ -703,7 +717,8 @@ def main():
                         hold_since = None
                         release_since = time.perf_counter()
                     if time.perf_counter() - last_paint >= 0.2:
-                        update_overlay({"status": "PAUSED"})
+                        update_overlay({"status": "PAUSED",
+                                        "mode": ctrl_mode_name()})
                         last_paint = time.perf_counter()
                         win32gui.PumpWaitingMessages()
                     time.sleep(PAUSE_POLL_S)
@@ -879,10 +894,12 @@ def main():
                     info = {
                         "status": "RUNNING",
                         "fps": fps,
+                        "mode": ctrl_mode_name(),
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
-                                f"mode={ctrl_tag}"),
+                                f"key={'HOLD' if is_holding else 'rel '} "
+                                f"fs={int(fish_seen_now)} bs={int(bar_seen_now)}"),
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
