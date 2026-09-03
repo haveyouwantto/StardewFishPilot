@@ -1,0 +1,9 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+mss>=9.0.0
+pynput>=1.7.6
+pywin32>=306
+ultralytics>=8.2.0
+
+# GPU 推理（CUDA 版 torch，按需执行）:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121

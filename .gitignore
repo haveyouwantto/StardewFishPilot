@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Ultralytics 标签缓存
+yolo_dataset/labels/*.cache
+
+# 虚拟环境
+.venv/
+
+# 基础 YOLO 权重（ultralytics 可重新下载）
+yolov8n.pt
+
+# 训练中间权重（best.pt 已提交，last.pt 仅用于断点续训）
+yolo_runs/stardew_fish/weights/last.pt

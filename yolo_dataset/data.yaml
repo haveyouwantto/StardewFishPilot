@@ -1,0 +1,6 @@
+path: yolo_dataset
+train: images/train
+val: images/val
+names:
+  0: bar
+  1: fish
