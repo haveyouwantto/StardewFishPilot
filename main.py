@@ -397,13 +397,14 @@ def yolo_detect(frame, imgsz):
     return fish_pt, bar_box
 
 
-def detect_objects(frame, imgsz=IMGSZ):
+def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True):
     """按当前 detect_mode 在 frame(局部坐标) 上检测，返回 (fish_pt, bar_box)。"""
     if detect_mode == "cv":
         return cv_detect.detect(frame, cv_fish_tpl)
     yolo_fish, yolo_bar = yolo_detect(frame, imgsz)
-    if detect_mode == "mixed":
-        cv_bar = cv_detect.detect_bar(frame)
+    if detect_mode == "mixed" and use_cv_bar:
+        cv_bar = cv_detect.detect_bar(
+            frame, center_y=yolo_fish[1] if yolo_fish else None)
         return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
     return yolo_fish, yolo_bar
 
@@ -624,8 +625,8 @@ def main():
                     # 思路：全屏模板找可疑 UI -> 只对可疑框做检测 -> 发现鱼才锁定
                     hit = locate_ui(frame) if tpl_ui is not None else None
                     if hit is None:
-                        # 无模板/没命中：退化为全图检测（不锁定）
-                        fish_pt, bar_box = detect_objects(frame)
+                        # 无模板/没命中：退化为全图 YOLO（无 ROI 不跑传统条检测）
+                        fish_pt, bar_box = detect_objects(frame, use_cv_bar=False)
                     else:
                         hx, hy, hw, hh = hit
                         pad = 20

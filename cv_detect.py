@@ -28,6 +28,7 @@ BAR_MIN_AREA_RATIO = 0.006     # 相对整帧的最小面积比
 BAR_MAX_W_RATIO = 0.60         # 最大宽度占帧宽比例
 BAR_ASPECT_MIN = 1.6           # 高/宽比下限（竖长绿条）
 BAR_ASPECT_MAX = 10.0          # 上限（排除又高又窄的进度条）
+BAR_Y_BAND_RATIO = 0.45        # 以鱼 y 为中心的搜索带（占帧高比例）
 
 
 def load_fish_template(path):
@@ -65,12 +66,22 @@ def detect_fish(frame_bgr, tpl_bgr):
     return (float(best[1]), float(best[2]))
 
 
-def detect_bar(frame_bgr):
-    """HSV 绿色掩码 + 形状筛选，返回 bar (x1,y1,x2,y2) 或 None。"""
+def detect_bar(frame_bgr, center_y=None, band=None):
+    """只在给定 y 附近找绿条（默认整帧搜索），返回 (x1,y1,x2,y2) 或 None。
+    返回坐标始终是整帧坐标。"""
     if frame_bgr is None or frame_bgr.size == 0:
         return None
     fh, fw = frame_bgr.shape[:2]
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    y0, y1 = 0, fh
+    if center_y is not None:
+        band = band if band is not None else max(80.0, fh * BAR_Y_BAND_RATIO)
+        y0 = max(0, int(center_y - band))
+        y1 = min(fh, int(center_y + band))
+        if y1 - y0 < 40:
+            y0, y1 = 0, fh
+    search = frame_bgr[y0:y1]
+    sh = y1 - y0
+    hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, GREEN_HSV_LOW, GREEN_HSV_HIGH)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
@@ -78,7 +89,7 @@ def detect_bar(frame_bgr):
                             cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = max(BAR_MIN_AREA, fw * fh * BAR_MIN_AREA_RATIO)
+    min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
     best_area = 0.0
     best_box = None
     for c in cnts:
@@ -93,12 +104,13 @@ def detect_bar(frame_bgr):
             continue
         if area > best_area:
             best_area = area
-            best_box = (float(x), float(y), float(x + w), float(y + h))
+            best_box = (float(x), float(y0 + y), float(x + w),
+                        float(y0 + y + h))
     return best_box
 
 
 def detect(frame_bgr, fish_tpl):
     """一次返回 (fish_pt, bar_box)，与 yolo_detect 输出一致。"""
     fish = detect_fish(frame_bgr, fish_tpl)
-    bar = detect_bar(frame_bgr)
+    bar = detect_bar(frame_bgr, center_y=fish[1] if fish else None)
     return fish, bar
