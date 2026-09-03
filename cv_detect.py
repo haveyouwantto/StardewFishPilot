@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""
+传统视觉检测（替代 YOLO）：
+  - fish: 精确模板匹配（templates/fish.png）
+  - bar:  UI 里的绿色矩形（HSV 颜色分割 + 形状筛选）
+
+返回的坐标均为局部图像坐标，接口与 yolo_detect 一致：
+  fish_pt = (cx, cy) 或 None
+  bar_box = (x1, y1, x2, y2) 或 None
+"""
+
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+# ---------------- fish 模板匹配参数 ----------------
+FISH_SCALES = (0.8, 0.9, 1.0, 1.1, 1.2)
+FISH_MIN_SCORE = 0.40          # 匹配分阈值，太低会误检
+
+# ---------------- bar 绿色矩形参数 ----------------
+GREEN_HSV_LOW = np.array([35, 80, 80], np.uint8)
+GREEN_HSV_HIGH = np.array([95, 255, 255], np.uint8)
+BAR_MIN_AREA = 800.0           # 最小面积(px²)
+BAR_MIN_AREA_RATIO = 0.006     # 相对整帧的最小面积比
+BAR_MAX_W_RATIO = 0.60         # 最大宽度占帧宽比例
+BAR_ASPECT_MIN = 1.6           # 高/宽比下限（竖长绿条）
+BAR_ASPECT_MAX = 10.0          # 上限（排除又高又窄的进度条）
+
+
+def load_fish_template(path):
+    p = Path(path)
+    if not p.exists():
+        return None
+    return cv2.imread(str(p), cv2.IMREAD_COLOR)
+
+
+def detect_fish(frame_bgr, tpl_bgr):
+    """模板匹配鱼图标，返回 (cx, cy) 或 None。"""
+    if tpl_bgr is None or frame_bgr is None or frame_bgr.size == 0:
+        return None
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    tpl = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2GRAY)
+    th, tw = tpl.shape[:2]
+    fh, fw = frame_bgr.shape[:2]
+
+    best = None
+    for s in FISH_SCALES:
+        nw, nh = int(tw * s), int(th * s)
+        if nw < 6 or nh < 6 or nw >= fw or nh >= fh:
+            continue
+        r = cv2.resize(tpl, (nw, nh), interpolation=cv2.INTER_AREA)
+        res = cv2.matchTemplate(gray, r, cv2.TM_CCOEFF_NORMED)
+        _, max_v, _, max_loc = cv2.minMaxLoc(res)
+        if best is None or max_v > best[0]:
+            best = (max_v, max_loc[0] + nw / 2, max_loc[1] + nh / 2)
+
+    if best is None or best[0] < FISH_MIN_SCORE:
+        return None
+    return (float(best[1]), float(best[2]))
+
+
+def detect_bar(frame_bgr):
+    """HSV 绿色掩码 + 形状筛选，返回 bar (x1,y1,x2,y2) 或 None。"""
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None
+    fh, fw = frame_bgr.shape[:2]
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GREEN_HSV_LOW, GREEN_HSV_HIGH)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(BAR_MIN_AREA, fw * fh * BAR_MIN_AREA_RATIO)
+    best_area = 0.0
+    best_box = None
+    for c in cnts:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+        if area < min_area or w <= 1 or h <= 1:
+            continue
+        if w > fw * BAR_MAX_W_RATIO:
+            continue
+        aspect = h / w
+        if aspect < BAR_ASPECT_MIN or aspect > BAR_ASPECT_MAX:
+            continue
+        if area > best_area:
+            best_area = area
+            best_box = (float(x), float(y), float(x + w), float(y + h))
+    return best_box
+
+
+def detect(frame_bgr, fish_tpl):
+    """一次返回 (fish_pt, bar_box)，与 yolo_detect 输出一致。"""
+    fish = detect_fish(frame_bgr, fish_tpl)
+    bar = detect_bar(frame_bgr)
+    return fish, bar

@@ -16,7 +16,7 @@ Stardew Valley Auto Fishing Bot - YOLO 版
   - 暂停时不截图、不推理，几乎不占 CPU
   - Overlay 限频重绘
 
-热键: F8 开始/暂停, F9 退出
+热键: F8 开始/暂停, F7 切换控制模式, F6 切换 CV/YOLO 检测, F9 退出
 依赖:
   pip install ultralytics opencv-python numpy mss pynput pywin32
 
@@ -33,6 +33,7 @@ from collections import deque
 from pathlib import Path
 
 import cv2
+import cv_detect
 import numpy as np
 import mss
 from pynput.keyboard import Key, Controller, Listener
@@ -62,6 +63,7 @@ USE_QUANTIZE_ARG = "quantize" in DEFAULT_CFG_DICT  # ultralytics>=8.4 用 quanti
 #   "rl"     = rl_fishing 训练的策略
 # 命令行 --mode 或启动时菜单可以覆盖这里；运行中 F7 仍可切换。
 CONTROL_MODE = "simple"
+DETECT_MODE = "cv"        # "cv" = 传统模板+绿色矩形, "yolo" = YOLO
 
 HOLD_KEY = "c"
 SIMPLE_BAND = 12          # SIMPLE 迟滞带 px：按住中鱼低于中心 12px 才松，
@@ -117,6 +119,7 @@ RL_VEL_FACTOR = 0.35      # 真实游戏 bar 比训练环境快，先缩小速�
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
 TOGGLE_HOTKEY = Key.f7    # 运行时切换 RL / PID
+TOGGLE_DETECT_HOTKEY = Key.f6   # 运行时切换 cv / YOLO 检测
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SCRIPT_DIR / "templates"
@@ -133,12 +136,15 @@ device = "cpu"
 is_torch_model = True
 engine_name = "CPU"
 tpl_ui = None
+cv_fish_tpl = None
+detect_mode = DETECT_MODE
+yolo_engine_name = "CUDA"
 has_rl = False            # 是否成功加载 RL 模型
 ctrl_mode = 2             # F7 循环: 0=RL 1=PID 2=SIMPLE；默认 SIMPLE 便于回退
 
 
 def on_press(key):
-    global running, exit_flag, ctrl_mode
+    global running, exit_flag, ctrl_mode, detect_mode, engine_name
     try:
         if key == START_HOTKEY:
             running = not running
@@ -155,6 +161,11 @@ def on_press(key):
                 break
             names = {0: "RL", 1: "PID", 2: "SIMPLE"}
             print(f"控制模式: {names[ctrl_mode]}")
+        elif key == TOGGLE_DETECT_HOTKEY:
+            detect_mode = "yolo" if detect_mode == "cv" else "cv"
+            engine_name = ("CV" if detect_mode == "cv"
+                           else yolo_engine_name)
+            print(f"检测模式: {detect_mode.upper()}")
     except Exception:
         pass
 
@@ -180,7 +191,16 @@ def find_weights():
 
 
 def load_models():
-    global model, device, is_torch_model, engine_name, tpl_ui
+    global model, device, is_torch_model, engine_name, tpl_ui, cv_fish_tpl
+    global yolo_engine_name
+
+    # YOLO 与 CV 检测器都加载，F6 可随时切换
+    cv_fish_tpl = cv_detect.load_fish_template(TEMPLATE_DIR / "fish.png")
+    if cv_fish_tpl is not None:
+        print("传统检测: fish 模板已加载")
+    else:
+        print("警告: templates/fish.png 不存在，CV 模式鱼将无法检测")
+
     w = find_weights()
     if w is None:
         w = SCRIPT_DIR / "yolov8n.pt"
@@ -196,13 +216,15 @@ def load_models():
         model.to(device)
         model.fuse()
         if device != "cpu":
-            engine_name = "CUDA"
-            print(f"推理设备: GPU {torch.cuda.get_device_name(0)} (FP16)")
+            yolo_engine_name = "CUDA"
+            print(f"YOLO 推理: GPU {torch.cuda.get_device_name(0)} (FP16)")
         else:
-            print("推理设备: CPU（未检测到 CUDA，帧率会较低）")
+            yolo_engine_name = "CPU"
+            print("YOLO 推理: CPU（未检测到 CUDA，帧率会较低）")
     else:
-        engine_name = "ONNX"
-        print(f"推理设备: ONNX ({'CUDA' if device != 'cpu' else 'CPU'})")
+        yolo_engine_name = "ONNX"
+        print(f"YOLO 推理: ONNX ({'CUDA' if device != 'cpu' else 'CPU'})")
+    engine_name = "CV" if detect_mode == "cv" else yolo_engine_name
 
     ui_full = TEMPLATE_DIR / "ui_full.png"
     if ui_full.exists():
@@ -632,7 +654,7 @@ def main():
 
     print("=" * 52)
     print("  星露谷自动钓鱼 - YOLO 版")
-    print("  F8 开始/暂停 | F7 切换 RL/PID/SIMPLE | F9 退出")
+    print("  F8 开始/暂停 | F7 切换控制 | F6 切换检测 | F9 退出")
     print("=" * 52)
 
     load_models()
@@ -655,7 +677,8 @@ def main():
         print("RL 模型不可用，回退到 PID")
         ctrl_mode = 1
     mode_names = {0: "RL", 1: "PID", 2: "SIMPLE"}
-    print(f"启动控制模式: {mode_names[ctrl_mode]}（F7 可切换）")
+    print(f"启动控制模式: {mode_names[ctrl_mode]}（F7 可切换）  "
+          f"检测模式: {detect_mode.upper()}（F6 可切换）")
     dbg_log = []
     dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
@@ -751,8 +774,11 @@ def main():
                                 ui_miss = 0
                                 print("UI 丢失，重新全屏定位")
 
-                # ---------- YOLO：锁定后 frame 已是 UI 区域 ----------
-                fish_pt, bar_box = yolo_detect(frame, IMGSZ)
+                # ---------- 目标检测（CV 模板 / YOLO，F6 切换） ----------
+                if detect_mode == "cv":
+                    fish_pt, bar_box = cv_detect.detect(frame, cv_fish_tpl)
+                else:
+                    fish_pt, bar_box = yolo_detect(frame, IMGSZ)
 
                 # ---------- 检测稳定性：短时记忆 + 跳变过滤 ----------
                 fish_seen_now = False
