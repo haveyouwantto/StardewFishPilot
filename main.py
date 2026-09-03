@@ -8,8 +8,8 @@ Stardew Valley Auto Fishing Bot - YOLO 版
   - YOLO: 0=bar, 1=fish（与 yolo_dataset/data.yaml 一致）
 
 控制:
-  - 实时估计 bar / 鱼的速度，按刹车距离决定按/松时机（不冲过头）
-  - 贴近鱼时用 PID 微调悬停；加速度参数在线自适应
+  - 默认用 rl_fishing 训练的 RL 策略（观测为归一化位置/速度/进度/上一动作）
+  - 无 RL 模型时回退到“速度预测 + 刹车时机 + PID 微调”
 
 性能:
   - 自动 CUDA 推理（可用时 FP16），支持同目录 best.onnx
@@ -94,6 +94,16 @@ STOP_FACTOR = 1.5        # 刹车距离放大系数（>1 提前切键，防冲�
 SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
+
+# ====================== RL 集成 ======================
+# 用 rl_fishing 里训练好的策略做按键决策（取代 PID）。
+# 观测与训练环境一致：[bar_y, bar_vel, fish_y, fish_vel, progress, prev_action]，
+# 位置按 UI 轨道高度归一化，速度按“虚拟池塘 568px、60Hz”换算。
+USE_RL = True
+RL_PROGRESS = 0.30        # 暂未读游戏进度条，先用训练初始值附近估计
+RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 保持一致
+RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 保持一致
+RL_TICK_HZ = 60.0
 
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
@@ -456,9 +466,8 @@ class FishPID:
             self.a_release += ACCEL_ALPHA * (mag - self.a_release)
         self.prev_v = self.v_bar
 
-    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
-        """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
-        # 停顿过久(换局/动画)后清空历史，避免用旧数据
+    def observe(self, t, bar_cy, fish_y, bar_seen, fish_seen):
+        """只更新位置/速度估计（RL 模式也用它构造观测）。返回本帧 dt。"""
         if self.last_t is None or t - self.last_t > 0.5:
             self.reset()
             self.last_t = t
@@ -477,7 +486,11 @@ class FishPID:
         raw = _linfit_slope(self.fish_hist)
         if raw is not None:
             self.v_fish = self._smooth(self.v_fish, raw)
+        return dt
 
+    def control(self, t, bar_cy, fish_y, bar_seen, fish_seen):
+        """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
+        dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
         self._update_accel(dt)
 
         # 用鱼的速度外推一小段距离，提前判断落点
@@ -524,6 +537,55 @@ class FishPID:
         return action
 
 
+# ====================== RL 策略（替代 PID 决策） ======================
+class RLPolicy:
+    """加载 rl_fishing/models 下的 PPO 策略。"""
+
+    def __init__(self, path):
+        from stable_baselines3 import PPO
+
+        self.model = PPO.load(str(path), device="cpu")
+
+    def decide(self, obs):
+        act = self.model.predict(obs.reshape(1, -1), deterministic=True)[0][0]
+        return bool(int(act))   # True=按住
+
+
+def load_rl_policy():
+    if not USE_RL:
+        print("USE_RL=False，控制模式: PID")
+        return None
+    model_dir = SCRIPT_DIR / "rl_fishing" / "models"
+    best = model_dir / "best_model.zip"
+    path = best if best.exists() else model_dir / "final_model.zip"
+    if not path.exists():
+        print("未找到 RL 模型，控制模式: PID")
+        return None
+    try:
+        rl = RLPolicy(path)
+        print(f"控制模式: RL（{path}）")
+        return rl
+    except Exception as exc:
+        print(f"RL 模型加载失败，控制模式: PID（{exc}）")
+        return None
+
+
+def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
+    """构造与训练环境一致的 6 维观测（真实像素 -> 虚拟池塘归一化）。"""
+    x, y, w, h = ui_rect
+    th = max(1.0, float(h))
+    pos_f = float(np.clip((fish_y - y) / th, 0.0, 1.0))
+    pos_b = float(np.clip((bar_cy - y) / th, 0.0, 1.0))
+    # 真实速度 px/s -> 虚拟速度(px/tick)，再按 VEL_SCALE 归一化
+    k = RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE)
+    vel_f = float(np.clip(pid.v_fish * k, -1.0, 1.0))
+    vel_b = float(np.clip(pid.v_bar * k, -1.0, 1.0))
+    return np.array(
+        [pos_b, vel_b, pos_f, vel_f, RL_PROGRESS, float(prev_action)],
+        dtype=np.float32,
+    )
+
+
 # ====================== 主循环 ======================
 def main():
     global running, exit_flag
@@ -545,6 +607,7 @@ def main():
     release_since = 0.0     # 上次松开时刻
     was_running = False
     pid = FishPID()
+    rl = load_rl_policy()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
     ui_hits = 0          # 未锁定阶段的连续命中次数
@@ -644,17 +707,34 @@ def main():
                     if bar_mem > BAR_MEMORY_FRAMES:
                         last_bar = None
 
-                # ---------- 按键控制（速度预测 + PID） ----------
+                # ---------- 按键控制（RL 或 PID） ----------
                 ctrl_t = time.perf_counter()
+                ctrl_tag = "PID"
                 if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    act = pid.control(
-                        ctrl_t,
-                        bar_cy,
-                        last_fish[1],
-                        bar_seen=bar_box is not None,
-                        fish_seen=fish_pt is not None,
-                    )
+                    if rl is not None and ui_rect is not None:
+                        ctrl_tag = "RL"
+                        pid.observe(
+                            ctrl_t,
+                            bar_cy,
+                            last_fish[1],
+                            bar_seen=bar_box is not None,
+                            fish_seen=fish_pt is not None,
+                        )
+                        obs = rl_make_obs(
+                            last_fish[1], bar_cy, ui_rect, pid, int(is_holding)
+                        )
+                        act = rl.decide(obs)
+                        pid.err = last_fish[1] - bar_cy     # 仅用于显示
+                        pid.target_v = 0.0
+                    else:
+                        act = pid.control(
+                            ctrl_t,
+                            bar_cy,
+                            last_fish[1],
+                            bar_seen=bar_box is not None,
+                            fish_seen=fish_pt is not None,
+                        )
                     if act is True:
                         if (not is_holding and
                                 ctrl_t - release_since >= MIN_RELEASE_S):
@@ -686,7 +766,7 @@ def main():
                         "ui": ui_rect,
                         "dbg": (f"e={pid.err:+.0f} vb={pid.v_bar:+.0f} "
                                 f"vf={pid.v_fish:+.0f} vt={pid.target_v:+.0f} "
-                                f"ap={pid.a_press:.0f} ar={pid.a_release:.0f}"),
+                                f"mode={ctrl_tag}"),
                     }
                     if fish_pt is not None:
                         info["fish_pt"] = (ox + fish_pt[0], oy + fish_pt[1])
