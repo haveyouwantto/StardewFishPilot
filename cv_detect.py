@@ -29,9 +29,6 @@ BAR_MAX_W_RATIO = 0.60         # 最大宽度占帧宽比例
 BAR_ASPECT_MIN = 1.6           # 高/宽比下限（竖长绿条）
 BAR_ASPECT_MAX = 10.0          # 上限（排除又高又窄的进度条）
 BAR_Y_BAND_RATIO = 0.45        # 以鱼 y 为中心的搜索带（占帧高比例）
-BAR_MERGE_GAP_PX = 50.0        # 被鱼遮挡打断的两段绿色，垂直间隙小于该值视为同一 bar
-BAR_ASPECT_MAX = 12.0          # 合并后整体高宽比上限（排除进度条）
-BAR_MAX_TEXTURE = 30.0         # 绿条内部平均纹理上限：纯色 bar 纹理低，草地高
 
 
 def load_fish_template(path):
@@ -70,8 +67,8 @@ def detect_fish(frame_bgr, tpl_bgr):
 
 
 def detect_bar(frame_bgr, fish=None, band=None):
-    """纹理平滑 + 合并：把被鱼遮挡打断的绿色段连成连续 bar。
-    返回 (x1,y1,x2,y2) 整帧坐标或 None。"""
+    """只在给定 y 附近找绿条（默认整帧搜索），返回 (x1,y1,x2,y2) 或 None。
+    返回坐标始终是整帧坐标。"""
     if frame_bgr is None or frame_bgr.size == 0:
         return None
     fh, fw = frame_bgr.shape[:2]
@@ -87,72 +84,34 @@ def detect_bar(frame_bgr, fish=None, band=None):
     sh = y1 - y0
     hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, GREEN_HSV_LOW, GREEN_HSV_HIGH)
-    # 纹理平滑：中值去噪 + 纵向大闭运算把鱼遮挡造成的断口补成连续绿色
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 31)))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)))
 
-    # 平滑度检测：bar 是均匀纯色，边缘/纹理量很低
-    gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_32F)
-    tex = cv2.convertScaleAbs(lap)
-
-    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
-    comps = []
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
-    for i in range(1, n):
-        x, y, w, h, area = stats[i]
+    best_area = 0.0
+    best_box = None
+    for c in cnts:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
         if area < min_area or w <= 1 or h <= 1:
             continue
         if w > fw * BAR_MAX_W_RATIO:
             continue
-        comp_mask = (labels == i).astype(np.uint8) * 255
-        tex_mean = float(cv2.mean(tex, comp_mask)[0])
-        comps.append((int(x), int(y), int(w), int(h),
-                      float(cent[i][0]), float(area), tex_mean))
-
-    # 合并：水平位置接近、垂直间隙小（鱼遮挡形成的空洞）的绿段归为同一 bar
-    groups = []
-    for c in comps:
-        placed = False
-        for g in groups:
-            for m in g:
-                dx = abs(c[4] - m[4])
-                gap = max(0, m[1] - (c[1] + c[3]), c[1] - (m[1] + m[3]))
-                if dx <= max(20.0, fw * 0.15) and gap <= BAR_MERGE_GAP_PX:
-                    g.append(c)
-                    placed = True
-                    break
-            if placed:
-                break
-        if not placed:
-            groups.append([c])
-
-    best_box = None
-    best_area = 0.0
-    for g in groups:
-        x1 = min(c[0] for c in g)
-        x2 = max(c[0] + c[2] for c in g)
-        yt = min(c[1] for c in g)
-        yb = max(c[1] + c[3] for c in g)
-        area = sum(c[5] for c in g)
-        tex_avg = sum(c[5] * c[6] for c in g) / max(1.0, area)
-        w = x2 - x1
-        aspect = (yb - yt) / max(1.0, w)
-        if w < max(6.0, fw * 0.05) or aspect > BAR_ASPECT_MAX:
+        aspect = h / w
+        if aspect < BAR_ASPECT_MIN or aspect > BAR_ASPECT_MAX:
             continue
-        if tex_avg > BAR_MAX_TEXTURE:     # 内部太花哨(草/纹理)的不是 bar
-            continue
-        if fish is not None and not (y0 + yt <= fish[1] <= y0 + yb):
-            continue
+        if fish is not None:
+            # 条必须穿过鱼的 y 中心点（用整帧坐标，搜索带裁切要加 y0 偏移）
+            gy0, gy1 = y0 + y, y0 + y + h
+            if not (gy0 <= fish[1] <= gy1):
+                continue
         if area > best_area:
             best_area = area
-            best_box = (float(x1), float(y0 + yt), float(x2),
-                        float(y0 + yb))
-
+            best_box = (float(x), float(y0 + y), float(x + w),
+                        float(y0 + y + h))
     return best_box
 
 
