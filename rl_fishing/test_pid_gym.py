@@ -59,19 +59,15 @@ def run_one(difficulty, behavior, eps=15, every=1, noise=0.0, delay=0,
 
 
 if __name__ == "__main__":
-    candidates = [
-        (0.04, 0.6, 6.0),   # 当前
-        (0.03, 0.6, 4.0),
-        (0.03, 0.7, 8.0),
-        (0.04, 0.7, 12.0),
-    ]
-    for kp, gain, db in candidates:
-        m.KP, m.PDM_GAIN, m.DEADBAND_PX = kp, gain, db
-        print(f"KP={kp} gain={gain} deadband={db:.0f}:")
+    m.KP, m.PDM_GAIN, m.DEADBAND_PX = 0.03, 0.6, 4.0
+    m.KD = 0.010
+    for kff in (0.0, 0.002, 0.005, 0.010):
+        m.KFF = kff
+        print(f"KFF={kff}:")
         for delay in (0, 2, 4):
             row = []
             for d, b in ((50, "mixed"), (50, "dart")):
-                win, acc, _ = run_one(d, b, eps=15, every=3,
+                win, acc, _ = run_one(d, b, eps=10, every=3,
                                       noise=3.0, delay=delay)
                 row.append(f"{b[0]}50={win:.2f}/{acc:.2f}")
             print(f"  delay={delay}: " + "  ".join(row))
