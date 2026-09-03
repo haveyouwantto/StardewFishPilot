@@ -82,29 +82,23 @@ BAR_MEMORY_FRAMES = 4     # bar 短暂漏检时的容错
 MAX_FISH_STEP_PX = 160.0  # 鱼相邻帧最大位移，超过视为误检(跳变)忽略
 MAX_BAR_STEP_PX = 220.0   # bar 相邻帧最大位移，超过视为误检(跳变)忽略
 
-# ====================== PID 控制参数 ======================
-# 坐标约定: y 向下为正；bar 中心 > 鱼 y 表示 bar 在鱼下方。
-# 控制器先估计 bar / 鱼的速度(px/s)，再由 PID 算出目标速度，
-# 用“实测 bar 速度 vs 目标速度”决定按/松的时机，避免只看位置冲过头。
-KP = 2.5                 # 位置增益：误差 1px ≈ 目标速度多 2.5px/s
-KI = 0.12                # 积分增益，消除持续偏差
-KD = 0.35                # 阻尼项（鱼与 bar 的相对速度），抑制过冲
-VEL_BAND = 12.0          # 速度死区 px/s，避免按键抖动
-INTEGRAL_LIMIT = 300.0   # 积分限幅
-FISH_LOOKAHEAD_S = 0.12  # 用鱼的速度外推一小段，提前反应
+# ====================== 控制参数（参考 stardew-valley-fishing-assistant） ======================
+# 坐标约定: y 向下为正；e = 鱼 - bar 中心，鱼在上方时 e<0。
+# 控制律: u = kp*e + kd*(v_fish - v_bar) + kff*v_fish
+#         误差死区 -> 施密特迟滞 -> 最短切换，量化成 按住/松开
+KP = 0.04                # 位置增益（参考项目 PD 参数）
+KD = 0.18                # 阻尼（误差变化率）
+KFF = 0.08               # 鱼速前馈
+DEADBAND_PX = 2.0        # 误差死区
+HYST_U = 0.08            # 控制量迟滞
+MIN_SWITCH_S = 0.001     # 最短切换间隔（参考默认几乎为 0，靠迟滞防抖）
+SMOOTH_ALPHA = 0.50      # 位置低通
+LARGE_ERR_PX = 55.0      # 大误差阈值
+LARGE_ERR_BOOST = 1.5    # 大误差时控制量放大
 VEL_WINDOW_S = 0.15      # bar 速度估计窗口：太大会让 PID 慢半拍
 FISH_WINDOW_S = 0.15     # 鱼速度估计窗口
 VEL_ALPHA = 0.80         # 速度低通滤波系数（越大越跟手、噪声越大）
 MAX_SPEED = 1600.0       # 速度估计上限，防止单帧抖动带偏
-A_PRESS_SEED = 2800.0    # 按住时加速度估计初值 px/s^2（运行中自适应）
-A_RELEASE_SEED = 900.0   # 松开时加速度估计初值 px/s^2
-ACCEL_ALPHA = 0.12       # 加速度估计的学习率
-CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
-MPC_HORIZON_S = 0.24     # 轨迹预测时长：把按/松两条轨迹各推演这么久再比较
-MPC_STEPS = 12           # 轨迹推演步数
-V_LIMIT_UP = 900.0       # 上升速度上限 px/s（推演用，防止轨迹发散）
-V_LIMIT_DOWN = 700.0     # 下落速度上限 px/s
-EDGE_BAND_PX = 30.0      # 靠近轨道顶部/底部的边界判断带
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
 
@@ -445,12 +439,11 @@ def _linfit_slope(points):
 
 
 class FishPID:
-    """速度预测 + 刹车时机 + PID 微调控制器。
+    """参考 stardew-valley-fishing-assistant 的 PD + 迟滞控制器。
 
-    - bar / 鱼速度由滑动窗口拟合实时估计（v_bar、v_fish，向下为正 px/s）
-    - bar 远离鱼时：按住/松开让 bar 朝鱼加速，但用“刹车距离
-      v²/(2a)”预测什么时候该提前松手/按下，避免冲过头
-    - 鱼贴近 bar 中心时：用 PID 目标速度 u 做微调，平稳悬停
+    - 位置先低通（SMOOTH_ALPHA），速度由最新帧差分估计
+    - u = kp*e + kd*(v_fish - v_bar) + kff*v_fish
+    - e<0(鱼在上) → u<0 → 按住；经过死区/迟滞/最短切换防抖
     """
 
     def __init__(self):
@@ -459,13 +452,12 @@ class FishPID:
         self.last_t = None
         self.v_bar = 0.0      # 估计 bar 速度，向下为正 px/s
         self.v_fish = 0.0     # 估计鱼速度
-        self.integral = 0.0
         self.last_action = None   # True=按住 / False=松开
         self.err = 0.0
         self.target_v = 0.0
-        self.prev_v = None
-        self.a_press = A_PRESS_SEED     # 按住时的向上加速度大小
-        self.a_release = A_RELEASE_SEED  # 松开时的向下加速度大小
+        self.fish_filt = None
+        self.bar_filt = None
+        self.last_switch_t = 0.0
 
     def reset(self):
         self.bar_hist.clear()
@@ -473,11 +465,10 @@ class FishPID:
         self.last_t = None
         self.v_bar = 0.0
         self.v_fish = 0.0
-        self.integral = 0.0
         self.last_action = None
-        self.prev_v = None
-        self.a_press = A_PRESS_SEED
-        self.a_release = A_RELEASE_SEED
+        self.fish_filt = None
+        self.bar_filt = None
+        self.last_switch_t = 0.0
 
     @staticmethod
     def _push(hist, max_age, t, y):
@@ -489,20 +480,6 @@ class FishPID:
     def _smooth(old, raw):
         v = old + VEL_ALPHA * (raw - old)
         return max(-MAX_SPEED, min(MAX_SPEED, v))
-
-    def _update_accel(self, dt):
-        """根据同一按键状态下的速度变化率，在线估计两个方向的加速度。"""
-        if (self.prev_v is None or self.last_action is None or dt <= 1e-3):
-            self.prev_v = self.v_bar
-            return
-        a = (self.v_bar - self.prev_v) / dt
-        if self.last_action and a < -120:          # 按住时速度变向上(负)
-            mag = min(abs(a), 6000.0)
-            self.a_press += ACCEL_ALPHA * (mag - self.a_press)
-        elif not self.last_action and a > 120:     # 松开时速度变向下(正)
-            mag = min(a, 6000.0)
-            self.a_release += ACCEL_ALPHA * (mag - self.a_release)
-        self.prev_v = self.v_bar
 
     def observe(self, t, bar_cy, fish_y, bar_seen, fish_seen):
         """只更新位置/速度估计（RL 模式也用它构造观测）。返回本帧 dt。"""
@@ -526,76 +503,51 @@ class FishPID:
             self.v_fish = self._smooth(self.v_fish, raw)
         return dt
 
-    def _sim_end(self, action, y0, bar_h, top, bottom):
-        """把当前 bar 状态按给定按键推演 MPC_HORIZON_S，返回结束位置。"""
-        y = y0
-        v = self.v_bar
-        dt = MPC_HORIZON_S / MPC_STEPS
-        acc = -self.a_press if action else self.a_release
-        for _ in range(MPC_STEPS):
-            v += acc * dt
-            if action:
-                v = max(v, -V_LIMIT_UP)
-            else:
-                v = min(v, V_LIMIT_DOWN)
-            y += v * dt
-            if bar_h > 0:
-                y_min = top + bar_h / 2
-                y_max = bottom - bar_h / 2
-                if y < y_min:
-                    y, v = y_min, 0.0
-                elif y > y_max:
-                    y, v = y_max, 0.0
-        return y
-
-    def _mpc_action(self, bar_cy, fish_y, bar_h, top, bottom):
-        """比较“按住”与“松开”两条轨迹推演后的落点，选更接近鱼的。"""
-        y_hold = self._sim_end(True, bar_cy, bar_h, top, bottom)
-        y_rel = self._sim_end(False, bar_cy, bar_h, top, bottom)
-        d_hold = abs(y_hold - fish_y)
-        d_rel = abs(y_rel - fish_y)
-        return d_hold <= d_rel
-
     def control(self, t, bar_cy, fish_y, bar_seen, fish_seen,
                 bar_h=0.0, top=0.0, bottom=0.0):
-        """每帧调用一次。返回 True=按住 / False=松开 / None=保持现状。"""
-        dt = self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
-        bar_top = bar_cy - bar_h / 2
-        bar_bot = bar_cy + bar_h / 2
-        at_edge = (bar_h > 0 and
-                   (bar_top <= top + EDGE_BAND_PX or
-                    bar_bot >= bottom - EDGE_BAND_PX))
-        if not at_edge:                     # 顶/底贴边时位置不变，加速度学不到
-            self._update_accel(dt)
+        """每帧调用一次。返回 True=按住 / False=松开。"""
+        self.observe(t, bar_cy, fish_y, bar_seen, fish_seen)
 
-        # 用鱼的速度外推一小段距离，提前判断落点
-        fish_pred = fish_y + self.v_fish * FISH_LOOKAHEAD_S
-        target_long = fish_y + self.v_fish * MPC_HORIZON_S
-        e = fish_pred - bar_cy
+        if not bar_seen or not fish_seen:   # 与参考一致：丢一帧就松开
+            self.last_action = False
+            return False
+
+        # 位置低通（参考 smooth_alpha=0.5）
+        if self.fish_filt is None:
+            self.fish_filt = float(fish_y)
+        else:
+            self.fish_filt = (SMOOTH_ALPHA * fish_y +
+                              (1 - SMOOTH_ALPHA) * self.fish_filt)
+        if self.bar_filt is None:
+            self.bar_filt = float(bar_cy)
+        else:
+            self.bar_filt = (SMOOTH_ALPHA * bar_cy +
+                             (1 - SMOOTH_ALPHA) * self.bar_filt)
+
+        e = self.fish_filt - self.bar_filt
+        e_p = e if abs(e) >= DEADBAND_PX else 0.0
+        u = (KP * e_p + KD * (self.v_fish - self.v_bar) +
+             KFF * self.v_fish)
+        if LARGE_ERR_PX > 0 and abs(e) > LARGE_ERR_PX:
+            u *= LARGE_ERR_BOOST
         self.err = e
-        self.integral = max(-INTEGRAL_LIMIT,
-                            min(INTEGRAL_LIMIT, self.integral + e * dt))
-        de = self.v_fish - self.v_bar
-        u = KP * e + KD * de + KI * self.integral + self.v_fish
         self.target_v = u
 
-        action = self.last_action if self.last_action is not None else False
-        if e > CHASE_BAND_PX or e < -CHASE_BAND_PX:
-            # 远离中心：轨迹推演决定按/松（会在中途提前减速，不冲过头）
-            action = self._mpc_action(bar_cy, target_long, bar_h, top, bottom)
-        else:                                # 贴近中心：PID 微调
-            if self.v_bar > u + VEL_BAND:
-                action = True                # 有点往下冲，按一下
-            elif self.v_bar < u - VEL_BAND:
-                action = False               # 上冲过头，松一下
-        # 边界兜底：到顶还按只会顶死，到底还松只会躺底
-        if bar_h > 0:
-            if bar_top <= top + EDGE_BAND_PX and target_long > bar_cy + 15:
-                action = False
-            elif bar_bot >= bottom - EDGE_BAND_PX and target_long < bar_cy - 15:
-                action = True
-        self.last_action = action
-        return action
+        prev = self.last_action if self.last_action is not None else False
+        if u < -HYST_U:
+            want = True
+        elif u > HYST_U:
+            want = False
+        else:
+            want = prev
+        # 最短切换间隔
+        if want != prev:
+            if t - self.last_switch_t < MIN_SWITCH_S:
+                want = prev
+            else:
+                self.last_switch_t = t
+        self.last_action = want
+        return want
 
 
 # ====================== RL 策略（替代 PID 决策） ======================
