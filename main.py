@@ -104,9 +104,11 @@ RL_PROGRESS = 0.30        # 暂未读游戏进度条，先用训练初始值附�
 RL_POND = 568.0           # 与 rl_fishing/env.py 的 POND 保持一致
 RL_VEL_SCALE = 6.0        # 与 rl_fishing/env.py 的 VEL_SCALE 保持一致
 RL_TICK_HZ = 60.0
+RL_VEL_FACTOR = 0.35      # 真实游戏 bar 比训练环境快，先缩小速度避免观测饱和(0.35 可调)
 
 START_HOTKEY = Key.f8
 STOP_HOTKEY = Key.f9
+TOGGLE_HOTKEY = Key.f7    # 运行时切换 RL / PID
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SCRIPT_DIR / "templates"
@@ -123,10 +125,11 @@ device = "cpu"
 is_torch_model = True
 engine_name = "CPU"
 tpl_ui = None
+rl_mode = USE_RL          # F7 可在运行中切换 RL / PID
 
 
 def on_press(key):
-    global running, exit_flag
+    global running, exit_flag, rl_mode
     try:
         if key == START_HOTKEY:
             running = not running
@@ -135,6 +138,9 @@ def on_press(key):
             exit_flag = True
             print("退出中...")
             return False
+        elif key == TOGGLE_HOTKEY:
+            rl_mode = not rl_mode
+            print(f"控制模式: {'RL' if rl_mode else 'PID'}")
     except Exception:
         pass
 
@@ -576,8 +582,9 @@ def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
     th = max(1.0, float(h))
     pos_f = float(np.clip((fish_y - y) / th, 0.0, 1.0))
     pos_b = float(np.clip((bar_cy - y) / th, 0.0, 1.0))
-    # 真实速度 px/s -> 虚拟速度(px/tick)，再按 VEL_SCALE 归一化
-    k = RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE)
+    # 真实速度 px/s -> 虚拟速度(px/tick)，再按 VEL_SCALE 归一化；
+    # RL_VEL_FACTOR 用于补偿真实游戏与训练环境的绝对速度差异
+    k = RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE) * RL_VEL_FACTOR
     vel_f = float(np.clip(pid.v_fish * k, -1.0, 1.0))
     vel_b = float(np.clip(pid.v_bar * k, -1.0, 1.0))
     return np.array(
@@ -592,7 +599,7 @@ def main():
 
     print("=" * 52)
     print("  星露谷自动钓鱼 - YOLO 版")
-    print("  F8 开始/暂停 | F9 退出")
+    print("  F8 开始/暂停 | F7 切换 RL/PID | F9 退出")
     print("=" * 52)
 
     load_models()
@@ -608,6 +615,22 @@ def main():
     was_running = False
     pid = FishPID()
     rl = load_rl_policy()
+    rl_log = []
+    rl_log_path = SCRIPT_DIR / "rl_debug.csv"
+
+    def flush_rl_log():
+        if not rl_log:
+            return
+        first = not rl_log_path.exists()
+        with open(rl_log_path, "a", encoding="utf-8", newline="") as f:
+            if first:
+                f.write(
+                    "t,fish_y,bar_y,vf_px_s,vb_px_s,pos_f,pos_b,"
+                    "vel_f,vel_b,action,prev_action,ui_h\n"
+                )
+            for row in rl_log:
+                f.write(",".join(row) + "\n")
+        rl_log.clear()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
     ui_hits = 0          # 未锁定阶段的连续命中次数
@@ -712,7 +735,7 @@ def main():
                 ctrl_tag = "PID"
                 if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    if rl is not None and ui_rect is not None:
+                    if rl is not None and ui_rect is not None and rl_mode:
                         ctrl_tag = "RL"
                         pid.observe(
                             ctrl_t,
@@ -727,6 +750,24 @@ def main():
                         act = rl.decide(obs)
                         pid.err = last_fish[1] - bar_cy     # 仅用于显示
                         pid.target_v = 0.0
+                        rl_log.append(
+                            [
+                                f"{ctrl_t:.3f}",
+                                f"{last_fish[1]:.1f}",
+                                f"{bar_cy:.1f}",
+                                f"{pid.v_fish:.1f}",
+                                f"{pid.v_bar:.1f}",
+                                f"{obs[2]:.3f}",
+                                f"{obs[0]:.3f}",
+                                f"{obs[3]:.3f}",
+                                f"{obs[1]:.3f}",
+                                "1" if act else "0",
+                                "1" if is_holding else "0",
+                                f"{ui_rect[3]:.0f}",
+                            ]
+                        )
+                        if len(rl_log) >= 500:
+                            flush_rl_log()
                     else:
                         act = pid.control(
                             ctrl_t,
@@ -787,6 +828,7 @@ def main():
 
                 time.sleep(max(0.0, 1.0 / FPS_TARGET - (time.perf_counter() - t0)))
     finally:
+        flush_rl_log()
         if is_holding:
             keyboard.release(HOLD_KEY)
         destroy_overlay()
