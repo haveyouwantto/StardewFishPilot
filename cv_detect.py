@@ -93,7 +93,6 @@ def detect_bar(frame_bgr, fish=None, band=None):
     min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
     best_area = 0.0
     best_box = None
-    candidates = []
     for c in cnts:
         area = cv2.contourArea(c)
         x, y, w, h = cv2.boundingRect(c)
@@ -104,29 +103,14 @@ def detect_bar(frame_bgr, fish=None, band=None):
         aspect = h / w
         if aspect < BAR_ASPECT_MIN or aspect > BAR_ASPECT_MAX:
             continue
-        candidates.append((area, x, y, w, h))
         if fish is not None:
-            # 硬约束：绿条垂直范围必须与鱼 y 有重叠（±60px），
-            # 水平中心也必须接近鱼 x，排除进度条/侧边绿块
-            y_overlap = (y - 60 <= fish[1] <= y + h + 60)
-            x_close = abs((x + w / 2) - fish[0]) <= max(60.0, fw * 0.3)
-            if not (y_overlap and x_close):
+            # 只要求绿条 y 范围与鱼 y 有交集
+            if not (y <= fish[1] <= y + h):
                 continue
         if area > best_area:
             best_area = area
             best_box = (float(x), float(y0 + y), float(x + w),
                         float(y0 + y + h))
-    if best_box is None and fish is not None and candidates:
-        # 鱼离条太远时退而求其次：选垂直距离最近的绿块，保证还能追
-        cx = fish[1]
-        best_d = None
-        best = None
-        for area, x, y, w, h in candidates:
-            dist = min(abs(cx - y), abs(cx - (y + h)))
-            if best_d is None or dist < best_d:
-                best_d = dist
-                best = (x, y0 + y, x + w, y0 + y + h)
-        best_box = best
     return best_box
 
 
