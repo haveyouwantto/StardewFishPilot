@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--level", type=int, default=0)
     ap.add_argument("--obs-noise", type=float, default=0.0)
     ap.add_argument("--no-window", action="store_true", help="不弹窗，纯统计")
+    ap.add_argument("--height", type=int, default=640, help="窗口高度上限 px")
     args = ap.parse_args()
     if args.behavior is not None and args.behavior not in BEHAVIORS:
         ap.error(f"--behavior 可选 {BEHAVIORS}")
@@ -41,7 +42,11 @@ def main():
     win = "RL Fishing (ESC quit)"
     if not args.no_window:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, 66 * 4, 579 * 4)
+        # 保持池塘 66:579 的窄长比例，但限制高度，避免超出屏幕
+        first_frame = env.render()
+        disp_h = min(first_frame.shape[0], max(120, args.height))
+        disp_w = max(1, round(first_frame.shape[1] * disp_h / first_frame.shape[0]))
+        cv2.resizeWindow(win, disp_w, disp_h)
 
     wins = fails = 0
     accs = []
@@ -64,7 +69,7 @@ def main():
                         img,
                         f"ep{ep} prog={info['progress']:.0f} diff={info['difficulty']} "
                         f"bh={info['behavior']} acc={np.mean(acc[-120:]):.2f}",
-                        (8, 579 * 4 - 10),
+                        (8, img.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0, 0, 0),
