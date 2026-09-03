@@ -17,5 +17,5 @@ yolo_runs/stardew_fish/weights/last.pt
 # RL 训练产物（可重新训练生成）
 rl_fishing/models/
 
-# 真实环境 RL 调试日志
-rl_debug.csv
+# 真实环境调试日志
+debug_log.csv

@@ -89,8 +89,8 @@ A_RELEASE_SEED = 650.0   # 松开时加速度估计初值 px/s^2
 ACCEL_ALPHA = 0.12       # 加速度估计的学习率
 CHASE_BAND_PX = 10.0     # 视为“鱼已贴近 bar 中心”的误差范围 px
 PRED_MARGIN_PX = 10.0    # 刹车距离预测的提前余量 px
-ACTUATION_LAG_S = 0.08   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
-STOP_FACTOR = 1.5        # 刹车距离放大系数（>1 提前切键，防冲过头）
+ACTUATION_LAG_S = 0.04   # 按键/游戏生效延迟估计：切键前还会继续滑行一段
+STOP_FACTOR = 1.15       # 刹车距离放大系数（>1 提前切键；过大容易追不上）
 SPEED_EPS = 18.0         # 判定 bar“基本静止”的速度阈值 px/s
 MIN_HOLD_S = 0.05        # 每次按键最短按住时间（帧间不抖键）
 MIN_RELEASE_S = 0.02     # 每次松开后的最短冷却
@@ -125,11 +125,12 @@ device = "cpu"
 is_torch_model = True
 engine_name = "CPU"
 tpl_ui = None
-rl_mode = USE_RL          # F7 可在运行中切换 RL / PID
+has_rl = False            # 是否成功加载 RL 模型
+ctrl_mode = 0             # F7 循环: 0=RL 1=PID 2=SIMPLE(旧上下判断)
 
 
 def on_press(key):
-    global running, exit_flag, rl_mode
+    global running, exit_flag, ctrl_mode
     try:
         if key == START_HOTKEY:
             running = not running
@@ -139,8 +140,13 @@ def on_press(key):
             print("退出中...")
             return False
         elif key == TOGGLE_HOTKEY:
-            rl_mode = not rl_mode
-            print(f"控制模式: {'RL' if rl_mode else 'PID'}")
+            for _ in range(3):          # 循环切换并跳过不可用的 RL
+                ctrl_mode = (ctrl_mode + 1) % 3
+                if ctrl_mode == 0 and not has_rl:
+                    continue
+                break
+            names = {0: "RL", 1: "PID", 2: "SIMPLE"}
+            print(f"控制模式: {names[ctrl_mode]}")
     except Exception:
         pass
 
@@ -558,21 +564,26 @@ class RLPolicy:
 
 
 def load_rl_policy():
+    global has_rl
     if not USE_RL:
         print("USE_RL=False，控制模式: PID")
+        has_rl = False
         return None
     model_dir = SCRIPT_DIR / "rl_fishing" / "models"
     best = model_dir / "best_model.zip"
     path = best if best.exists() else model_dir / "final_model.zip"
     if not path.exists():
         print("未找到 RL 模型，控制模式: PID")
+        has_rl = False
         return None
     try:
         rl = RLPolicy(path)
         print(f"控制模式: RL（{path}）")
+        has_rl = True
         return rl
     except Exception as exc:
         print(f"RL 模型加载失败，控制模式: PID（{exc}）")
+        has_rl = False
         return None
 
 
@@ -593,13 +604,25 @@ def rl_make_obs(fish_y, bar_cy, ui_rect, pid, prev_action):
     )
 
 
+def should_hold_simple(bar_box, fish_y):
+    """旧版简单判断：鱼在条内不动；鱼在条上方按住、下方松开。"""
+    if bar_box is None or fish_y is None:
+        return False
+    x1, y1, x2, y2 = bar_box
+    top, bottom, center = y1, y2, (y1 + y2) / 2
+    margin = max(3.0, (bottom - top) * 0.10)
+    if top + margin <= fish_y <= bottom - margin:
+        return False
+    return fish_y < center
+
+
 # ====================== 主循环 ======================
 def main():
     global running, exit_flag
 
     print("=" * 52)
     print("  星露谷自动钓鱼 - YOLO 版")
-    print("  F8 开始/暂停 | F7 切换 RL/PID | F9 退出")
+    print("  F8 开始/暂停 | F7 切换 RL/PID/SIMPLE | F9 退出")
     print("=" * 52)
 
     load_models()
@@ -615,22 +638,22 @@ def main():
     was_running = False
     pid = FishPID()
     rl = load_rl_policy()
-    rl_log = []
-    rl_log_path = SCRIPT_DIR / "rl_debug.csv"
+    dbg_log = []
+    dbg_log_path = SCRIPT_DIR / "debug_log.csv"
 
-    def flush_rl_log():
-        if not rl_log:
+    def flush_dbg_log():
+        if not dbg_log:
             return
-        first = not rl_log_path.exists()
-        with open(rl_log_path, "a", encoding="utf-8", newline="") as f:
+        first = not dbg_log_path.exists()
+        with open(dbg_log_path, "a", encoding="utf-8", newline="") as f:
             if first:
                 f.write(
-                    "t,fish_y,bar_y,vf_px_s,vb_px_s,pos_f,pos_b,"
-                    "vel_f,vel_b,action,prev_action,ui_h\n"
+                    "t,algo,fish_y,bar_y,vf_px_s,vb_px_s,pos_f,pos_b,"
+                    "vel_f,vel_b,action,holding,ui_h\n"
                 )
-            for row in rl_log:
+            for row in dbg_log:
                 f.write(",".join(row) + "\n")
-        rl_log.clear()
+        dbg_log.clear()
 
     ui_rect = None       # 屏幕坐标 (x, y, w, h)；None = 未锁定，需全屏找 UI
     ui_hits = 0          # 未锁定阶段的连续命中次数
@@ -735,7 +758,10 @@ def main():
                 ctrl_tag = "PID"
                 if last_fish is not None and last_bar is not None:
                     bar_cy = (last_bar[1] + last_bar[3]) / 2
-                    if rl is not None and ui_rect is not None and rl_mode:
+                    if ctrl_mode == 2:
+                        ctrl_tag = "SIMPLE"
+                        act = should_hold_simple(last_bar, last_fish[1])
+                    elif rl is not None and ui_rect is not None and ctrl_mode == 0:
                         ctrl_tag = "RL"
                         pid.observe(
                             ctrl_t,
@@ -750,25 +776,8 @@ def main():
                         act = rl.decide(obs)
                         pid.err = last_fish[1] - bar_cy     # 仅用于显示
                         pid.target_v = 0.0
-                        rl_log.append(
-                            [
-                                f"{ctrl_t:.3f}",
-                                f"{last_fish[1]:.1f}",
-                                f"{bar_cy:.1f}",
-                                f"{pid.v_fish:.1f}",
-                                f"{pid.v_bar:.1f}",
-                                f"{obs[2]:.3f}",
-                                f"{obs[0]:.3f}",
-                                f"{obs[3]:.3f}",
-                                f"{obs[1]:.3f}",
-                                "1" if act else "0",
-                                "1" if is_holding else "0",
-                                f"{ui_rect[3]:.0f}",
-                            ]
-                        )
-                        if len(rl_log) >= 500:
-                            flush_rl_log()
                     else:
+                        ctrl_tag = "PID"
                         act = pid.control(
                             ctrl_t,
                             bar_cy,
@@ -776,6 +785,36 @@ def main():
                             bar_seen=bar_box is not None,
                             fish_seen=fish_pt is not None,
                         )
+                    # 通用调试日志（任意模式都会记录）
+                    if ui_rect is not None:
+                        th = max(1.0, float(ui_rect[3]))
+                        k = (RL_POND / (th * RL_TICK_HZ * RL_VEL_SCALE)
+                             * RL_VEL_FACTOR)
+                        pos_f = np.clip((last_fish[1] - ui_rect[1]) / th, 0, 1)
+                        pos_b = np.clip((bar_cy - ui_rect[1]) / th, 0, 1)
+                        vel_f = np.clip(pid.v_fish * k, -1, 1)
+                        vel_b = np.clip(pid.v_bar * k, -1, 1)
+                    else:
+                        pos_f = pos_b = vel_f = vel_b = 0.0
+                    dbg_log.append(
+                        [
+                            f"{ctrl_t:.3f}",
+                            ctrl_tag,
+                            f"{last_fish[1]:.1f}",
+                            f"{bar_cy:.1f}",
+                            f"{pid.v_fish:.1f}",
+                            f"{pid.v_bar:.1f}",
+                            f"{float(pos_f):.3f}",
+                            f"{float(pos_b):.3f}",
+                            f"{float(vel_f):.3f}",
+                            f"{float(vel_b):.3f}",
+                            "1" if act else "0",
+                            "1" if is_holding else "0",
+                            f"{ui_rect[3]:.0f}" if ui_rect else "0",
+                        ]
+                    )
+                    if len(dbg_log) >= 500:
+                        flush_dbg_log()
                     if act is True:
                         if (not is_holding and
                                 ctrl_t - release_since >= MIN_RELEASE_S):
@@ -828,7 +867,7 @@ def main():
 
                 time.sleep(max(0.0, 1.0 / FPS_TARGET - (time.perf_counter() - t0)))
     finally:
-        flush_rl_log()
+        flush_dbg_log()
         if is_holding:
             keyboard.release(HOLD_KEY)
         destroy_overlay()
