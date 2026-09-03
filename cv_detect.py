@@ -31,6 +31,7 @@ BAR_ASPECT_MAX = 10.0          # 上限（排除又高又窄的进度条）
 BAR_Y_BAND_RATIO = 0.45        # 以鱼 y 为中心的搜索带（占帧高比例）
 BAR_MERGE_GAP_PX = 50.0        # 被鱼遮挡打断的两段绿色，垂直间隙小于该值视为同一 bar
 BAR_ASPECT_MAX = 12.0          # 合并后整体高宽比上限（排除进度条）
+BAR_MAX_TEXTURE = 30.0         # 绿条内部平均纹理上限：纯色 bar 纹理低，草地高
 
 
 def load_fish_template(path):
@@ -94,7 +95,12 @@ def detect_bar(frame_bgr, fish=None, band=None):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
 
-    n, _, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+    # 平滑度检测：bar 是均匀纯色，边缘/纹理量很低
+    gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    tex = cv2.convertScaleAbs(lap)
+
+    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
     comps = []
     min_area = max(BAR_MIN_AREA, fw * sh * BAR_MIN_AREA_RATIO)
     for i in range(1, n):
@@ -103,8 +109,10 @@ def detect_bar(frame_bgr, fish=None, band=None):
             continue
         if w > fw * BAR_MAX_W_RATIO:
             continue
+        comp_mask = (labels == i).astype(np.uint8) * 255
+        tex_mean = float(cv2.mean(tex, comp_mask)[0])
         comps.append((int(x), int(y), int(w), int(h),
-                      float(cent[i][0]), float(area)))
+                      float(cent[i][0]), float(area), tex_mean))
 
     # 合并：水平位置接近、垂直间隙小（鱼遮挡形成的空洞）的绿段归为同一 bar
     groups = []
@@ -131,9 +139,12 @@ def detect_bar(frame_bgr, fish=None, band=None):
         yt = min(c[1] for c in g)
         yb = max(c[1] + c[3] for c in g)
         area = sum(c[5] for c in g)
+        tex_avg = sum(c[5] * c[6] for c in g) / max(1.0, area)
         w = x2 - x1
         aspect = (yb - yt) / max(1.0, w)
         if w < max(6.0, fw * 0.05) or aspect > BAR_ASPECT_MAX:
+            continue
+        if tex_avg > BAR_MAX_TEXTURE:     # 内部太花哨(草/纹理)的不是 bar
             continue
         if fish is not None and not (y0 + yt <= fish[1] <= y0 + yb):
             continue
