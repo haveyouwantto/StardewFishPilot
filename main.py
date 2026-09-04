@@ -504,16 +504,19 @@ def yolo_detect(frame, imgsz):
     return fish_pt, bar_box
 
 
-def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True):
+def detect_objects(frame, imgsz=IMGSZ, use_cv_bar=True, scan_box=None):
     """按当前 detect_mode 在 frame(局部坐标) 上检测，返回 (fish_pt, bar_box)。"""
     if detect_mode == "cv":
         return cv_detect.detect(frame, cv_fish_tpl)
     yolo_fish, yolo_bar = yolo_detect(frame, imgsz)
-    if detect_mode == "mixed" and use_cv_bar:
+    if (detect_mode == "mixed" and use_cv_bar and
+            yolo_fish is not None):
+        # 有 fish 才开始识别 bar，且只能在 scan_box 内
         cv_bar = cv_detect.detect_bar(
             frame,
             fish_box=(yolo_fish[2], yolo_fish[3],
-                      yolo_fish[4], yolo_fish[5]) if yolo_fish else None)
+                      yolo_fish[4], yolo_fish[5]),
+            scan_box=scan_box)
         return yolo_fish, (cv_bar if cv_bar is not None else yolo_bar)
     return yolo_fish, yolo_bar
 
@@ -802,7 +805,9 @@ def main():
                         x2 = min(frame.shape[1], hx + hw + pad)
                         y2 = min(frame.shape[0], hy + hh + pad)
                         crop = frame[y1:y2, x1:x2]
-                        f, b = detect_objects(crop)
+                        f, b = detect_objects(
+                            crop,
+                            scan_box=(pad, pad, pad + hw, pad + hh))
                         if f is not None:
                             # 候选框里真有鱼 -> 锁这个 UI
                             ui_rect = (ox + hx, oy + hy, hw, hh)
@@ -814,7 +819,11 @@ def main():
                         # 候选框内没鱼：不锁定，也不浪费全图检测
                 else:
                     # 锁定后：整帧已经是 UI 区域，直接检测
-                    fish_pt, bar_box = detect_objects(frame, IMGSZ_ROI)
+                    fish_pt, bar_box = detect_objects(
+                        frame, IMGSZ_ROI,
+                        scan_box=(ROI_PAD, ROI_PAD,
+                                  ROI_PAD + ui_rect[2],
+                                  ROI_PAD + ui_rect[3]))
                     if do_ui_check and tpl_ui is not None:
                         hit = locate_ui(frame)
                         if hit is not None:

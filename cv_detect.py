@@ -61,7 +61,7 @@ def detect_fish(frame_bgr, tpl_bgr):
     return (float(best[1]), float(best[2]))
 
 
-def detect_bar(frame_bgr, fish_box=None):
+def detect_bar(frame_bgr, fish_box=None, scan_box=None):
     """简化版：只扫 fish 中心那一列。
 
     沿该列从上到下找连续绿色段；相邻两段之间的空隙如果落在 fish 框内
@@ -79,7 +79,23 @@ def detect_bar(frame_bgr, fish_box=None):
     if fx2 <= fx1 or fy2 <= fy1:
         return None
 
-    col = max(0, min(fw - 1, int(round((fx1 + fx2) / 2))))
+    # 只允许在给定 ROI(scan_box) 内识别；fish 不在 ROI 内就不检测 bar
+    if scan_box is not None:
+        sx0, sy0, sx1, sy1 = [int(round(v)) for v in scan_box]
+        sx0 = max(0, sx0)
+        sy0 = max(0, sy0)
+        sx1 = min(fw - 1, sx1)
+        sy1 = min(fh - 1, sy1)
+    else:
+        sx0, sy0, sx1, sy1 = 0, 0, fw - 1, fh - 1
+    if sx1 <= sx0 or sy1 <= sy0:
+        return None
+
+    col = int(round((fx1 + fx2) / 2))
+    fish_c = (fy1 + fy2) / 2
+    if not (sx0 <= col <= sx1 and sy0 <= fish_c <= sy1):
+        return None
+
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     col_mask = cv2.inRange(hsv[:, col:col + 1, :],
                            GREEN_HSV_LOW, GREEN_HSV_HIGH)[:, 0]
@@ -88,7 +104,7 @@ def detect_bar(frame_bgr, fish_box=None):
     start = None
     last_green = None
     gap = 0
-    for y in range(fh):
+    for y in range(sy0, sy1 + 1):
         if col_mask[y] > 0:
             if start is None:
                 start = y
