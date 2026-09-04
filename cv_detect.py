@@ -21,8 +21,9 @@ FISH_SCALES = (0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0)
 FISH_MIN_SCORE = 0.40          # 匹配分阈值，太低会误检
 
 # ---------------- bar 检测参数（单列扫描） ----------------
-GREEN_HSV_LOW = np.array([38, 90, 90], np.uint8)
-GREEN_HSV_HIGH = np.array([82, 255, 255], np.uint8)
+GREEN_HSV_LOW = np.array([40, 90, 90], np.uint8)    # 80°
+GREEN_HSV_HIGH = np.array([80, 255, 255], np.uint8) # 160°
+GREEN_GAP_TOL_PX = 3       # 连续绿允许的小断口，超过才视为一段结束
 
 
 def load_fish_template(path):
@@ -85,16 +86,22 @@ def detect_bar(frame_bgr, fish_box=None):
 
     runs = []
     start = None
+    last_green = None
+    gap = 0
     for y in range(fh):
         if col_mask[y] > 0:
             if start is None:
                 start = y
+            last_green = y
+            gap = 0
         else:
             if start is not None:
-                runs.append((start, y - 1))
-                start = None
+                gap += 1
+                if gap > GREEN_GAP_TOL_PX:
+                    runs.append((start, last_green))
+                    start = None
     if start is not None:
-        runs.append((start, fh - 1))
+        runs.append((start, last_green if last_green is not None else fh - 1))
 
     fish_h = fy2 - fy1
     cands = []
