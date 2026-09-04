@@ -338,6 +338,15 @@ def create_overlay():
         hwnd_overlay, win32api.RGB(0, 0, 0), 255, win32con.LWA_COLORKEY
     )
     win32gui.ShowWindow(hwnd_overlay, win32con.SW_SHOW)
+    # 窗口正常显示，但从所有屏幕截图中排除，识别框不会被拍进下一帧
+    try:
+        import ctypes
+
+        WDA_EXCLUDEFROMCAPTURE = 0x11
+        ctypes.windll.user32.SetWindowDisplayAffinity(
+            hwnd_overlay, WDA_EXCLUDEFROMCAPTURE)
+    except Exception:
+        print("提示: 系统不支持从截图排除 overlay，若识别受干扰请关闭绘制")
     print(f"Overlay {screen_w}x{screen_h}")
 
 
