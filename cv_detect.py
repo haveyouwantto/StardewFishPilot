@@ -21,8 +21,8 @@ FISH_SCALES = (0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0)
 FISH_MIN_SCORE = 0.40          # 匹配分阈值，太低会误检
 
 # ---------------- bar 检测参数（单列扫描） ----------------
-GREEN_HSV_LOW = np.array([35, 80, 80], np.uint8)
-GREEN_HSV_HIGH = np.array([95, 255, 255], np.uint8)
+GREEN_HSV_LOW = np.array([38, 90, 90], np.uint8)
+GREEN_HSV_HIGH = np.array([82, 255, 255], np.uint8)
 
 
 def load_fish_template(path):
@@ -97,7 +97,6 @@ def detect_bar(frame_bgr, fish_box=None):
         runs.append((start, fh - 1))
 
     fish_h = fy2 - fy1
-    fish_c = (fy1 + fy2) / 2
     cands = []
     i = 0
     while i < len(runs):
@@ -117,17 +116,10 @@ def detect_bar(frame_bgr, fish_box=None):
             cands.append((top, bot))
         i = j + 1
 
+    # 严格从上到下：取第一段高度达标的连续绿
     if not cands:
         return None
-    best = None
-    for top, bot in cands:
-        if top <= fish_c <= bot:
-            best = (top, bot)
-            break
-    if best is None:
-        best = min(cands, key=lambda r: min(abs(r[0] - fish_c),
-                                            abs(r[1] - fish_c)))
-    top, bot = best
+    top, bot = cands[0]
     return (float(fx1), float(top), float(fx2), float(bot))
 
 
